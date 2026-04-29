@@ -1,81 +1,83 @@
-import os
 import re
-import spotipy
-from spotipy.oauth2 import SpotifyClientCredentials
-from dotenv import load_dotenv
+import aiohttp
 
-load_dotenv()
+# Uses Spotify's anonymous web player token — no credentials required.
+# Works for any public playlist or album.
 
-_sp = None
-
-
-def _get_client() -> spotipy.Spotify:
-    global _sp
-    if _sp is None:
-        client_id = os.getenv('SPOTIFY_CLIENT_ID')
-        client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
-        if not client_id or not client_secret:
-            raise ValueError('Spotify credentials not set in .env (SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET)')
-        auth = SpotifyClientCredentials(client_id=client_id, client_secret=client_secret)
-        _sp = spotipy.Spotify(auth_manager=auth)
-    return _sp
+_ANON_TOKEN_URL = 'https://open.spotify.com/get_access_token?reason=transport&productType=web_player'
+_API_BASE = 'https://api.spotify.com/v1'
+_HEADERS = {'app-platform': 'WebPlayer'}
 
 
 def _extract_id(url: str, kind: str) -> str | None:
-    pattern = rf'open\.spotify\.com/{kind}/([A-Za-z0-9]+)'
-    m = re.search(pattern, url)
+    m = re.search(rf'open\.spotify\.com/{kind}/([A-Za-z0-9]+)', url)
     return m.group(1) if m else None
 
 
-def get_playlist_tracks(url: str) -> tuple[str, list[dict]]:
+async def _get_token(session: aiohttp.ClientSession) -> str:
+    async with session.get(_ANON_TOKEN_URL, headers=_HEADERS) as r:
+        r.raise_for_status()
+        data = await r.json()
+        return data['accessToken']
+
+
+async def _api_get(session: aiohttp.ClientSession, token: str, path: str, params: dict = None) -> dict:
+    async with session.get(
+        f'{_API_BASE}/{path}',
+        headers={**_HEADERS, 'Authorization': f'Bearer {token}'},
+        params=params or {}
+    ) as r:
+        r.raise_for_status()
+        return await r.json()
+
+
+async def get_playlist_tracks(url: str) -> tuple[str, list[dict]]:
     """Returns (playlist_name, list of {title, artist, search_query})"""
-    sp = _get_client()
     playlist_id = _extract_id(url, 'playlist')
     if not playlist_id:
         raise ValueError('Invalid Spotify playlist URL')
 
-    result = sp.playlist(playlist_id)
-    name = result['name']
-    tracks = []
-    items = result['tracks']['items']
+    async with aiohttp.ClientSession() as session:
+        token = await _get_token(session)
+        data = await _api_get(session, token, f'playlists/{playlist_id}', {'fields': 'name,tracks(items(track(name,artists(name))),next)'})
+        name = data['name']
+        tracks = []
+        items = data['tracks']['items']
+        next_url = data['tracks'].get('next')
 
-    while result['tracks'].get('next'):
-        result['tracks'] = sp.next(result['tracks'])
-        items.extend(result['tracks']['items'])
+        while next_url:
+            async with session.get(next_url, headers={**_HEADERS, 'Authorization': f'Bearer {token}'}) as r:
+                page = await r.json()
+            items.extend(page['items'])
+            next_url = page.get('next')
 
-    for item in items:
-        track = item.get('track')
-        if not track:
-            continue
-        title = track['name']
-        artists = ', '.join(a['name'] for a in track['artists'])
-        tracks.append({
-            'title': title,
-            'artist': artists,
-            'search_query': f'{title} {artists}',
-        })
+        for item in items:
+            track = item.get('track')
+            if not track:
+                continue
+            title = track['name']
+            artists = ', '.join(a['name'] for a in track['artists'])
+            tracks.append({'title': title, 'artist': artists, 'search_query': f'{title} {artists}'})
 
     return name, tracks
 
 
-def get_album_tracks(url: str) -> tuple[str, list[dict]]:
+async def get_album_tracks(url: str) -> tuple[str, list[dict]]:
     """Returns (album_name, list of {title, artist, search_query})"""
-    sp = _get_client()
     album_id = _extract_id(url, 'album')
     if not album_id:
         raise ValueError('Invalid Spotify album URL')
 
-    album = sp.album(album_id)
-    name = f"{album['name']} — {', '.join(a['name'] for a in album['artists'])}"
-    tracks = []
-    for track in album['tracks']['items']:
-        title = track['name']
-        artists = ', '.join(a['name'] for a in track['artists'])
-        tracks.append({
-            'title': title,
-            'artist': artists,
-            'search_query': f'{title} {artists}',
-        })
+    async with aiohttp.ClientSession() as session:
+        token = await _get_token(session)
+        data = await _api_get(session, token, f'albums/{album_id}', {'fields': 'name,artists(name),tracks(items(name,artists(name)))'})
+        name = f"{data['name']} — {', '.join(a['name'] for a in data['artists'])}"
+        tracks = []
+        for track in data['tracks']['items']:
+            title = track['name']
+            artists = ', '.join(a['name'] for a in track['artists'])
+            tracks.append({'title': title, 'artist': artists, 'search_query': f'{title} {artists}'})
+
     return name, tracks
 
 

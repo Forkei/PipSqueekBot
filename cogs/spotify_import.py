@@ -32,9 +32,9 @@ class SpotifyImport(commands.Cog):
 
         try:
             if kind == 'playlist':
-                name, tracks = sp_utils.get_playlist_tracks(url)
+                name, tracks = await sp_utils.get_playlist_tracks(url)
             else:
-                name, tracks = sp_utils.get_album_tracks(url)
+                name, tracks = await sp_utils.get_album_tracks(url)
         except ValueError as e:
             await msg.edit(embed=embeds.error(str(e)))
             return

@@ -59,9 +59,7 @@ CACHE_MAX_SONGS=500
 3. Enable: `Message Content Intent`, `Voice States`
 4. Invite your bot with scopes: `bot` + permissions: `Connect`, `Speak`, `Send Messages`, `Embed Links`, `Read Message History`
 
-**Getting Spotify credentials (optional):**
-1. Go to https://developer.spotify.com/dashboard
-2. Create an app → copy Client ID and Client Secret
+**Spotify** works out of the box for public playlists — no credentials needed.
 
 **Getting YouTube cookies (optional):**
 - Install the browser extension **"Get cookies.txt LOCALLY"**
