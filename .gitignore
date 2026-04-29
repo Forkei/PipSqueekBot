@@ -1,0 +1,22 @@
+# Secrets
+.env
+cookies.txt
+
+# Cache and database
+data/cache/
+data/db/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
