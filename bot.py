@@ -34,7 +34,7 @@ COGS = [
 
 @bot.event
 async def on_ready():
-    print(f'🐭 PipSqueek is online as {bot.user} (ID: {bot.user.id})')
+    print(f'[PipSqueek] Online as {bot.user} (ID: {bot.user.id})')
     await bot.change_presence(activity=discord.Activity(
         type=discord.ActivityType.listening,
         name=f'{PREFIX}play | {PREFIX}help'
@@ -66,9 +66,9 @@ async def main():
         for cog in COGS:
             try:
                 await bot.load_extension(cog)
-                print(f'  ✓ Loaded {cog}')
+                print(f'  [OK] Loaded {cog}')
             except Exception as e:
-                print(f'  ✗ Failed to load {cog}: {e}')
+                print(f'  [FAIL] Failed to load {cog}: {e}')
         await bot.start(TOKEN)
 
 
