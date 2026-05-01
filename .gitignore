@@ -17,6 +17,9 @@ env/
 dist/
 build/
 
+# Logs
+*.log
+
 # OS
 .DS_Store
 Thumbs.db

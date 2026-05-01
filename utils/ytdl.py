@@ -53,7 +53,7 @@ if COOKIES_FILE and os.path.exists(COOKIES_FILE):
 
 def _cache_path_for_id(video_id: str) -> str | None:
     for fname in os.listdir(CACHE_DIR):
-        if fname.startswith(video_id):
+        if fname.startswith(video_id) and not fname.endswith('.part'):
             return os.path.join(CACHE_DIR, fname)
     return None
 

@@ -1,11 +1,15 @@
 import asyncio
 import random
+import time
 import discord
 from discord.ext import commands
 from collections import deque
 from utils import ytdl, embeds
+from utils.ytdl import format_duration
 
-# Track dict shape: {id, title, url, duration, thumbnail, uploader, requester}
+LOOKAHEAD_DEPTH = 3
+
+YES_WORDS = {'yes', 'yup', 'yeah', 'y', 'yep', 'sure', 'ok', 'okay', '1', 'first', 'this', 'that', 'it'}
 
 
 class GuildPlayer:
@@ -13,12 +17,27 @@ class GuildPlayer:
         self.queue: deque[dict] = deque()
         self.current: dict | None = None
         self.voice_client: discord.VoiceClient | None = None
-        self.loop_mode: str = 'off'   # 'off', 'one', 'all'
+        self.text_channel: discord.TextChannel | None = None
+        self.loop_mode: str = 'off'
         self.autoplay: bool = False
+        self.dj_mode: bool = False
         self.volume: float = 0.5
+        self.play_start_time: float | None = None
         self._lock = asyncio.Lock()
+        self._predownload_tasks: dict[str, asyncio.Task] = {}
+
+    def kick_predownload(self):
+        for track in list(self.queue)[:LOOKAHEAD_DEPTH]:
+            vid_id = track.get('id')
+            if vid_id and vid_id not in self._predownload_tasks:
+                task = asyncio.create_task(ytdl.download_and_get_path(track['url'], vid_id))
+                self._predownload_tasks[vid_id] = task
 
     def clear(self):
+        for task in self._predownload_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._predownload_tasks.clear()
         self.queue.clear()
         self.current = None
         self.loop_mode = 'off'
@@ -53,13 +72,13 @@ class Music(commands.Cog):
             p.voice_client = await ctx.author.voice.channel.connect()
         return True
 
-    def _after_play(self, ctx: commands.Context, error=None):
+    def _after_play(self, guild_id: int, error=None):
         if error:
             print(f'[music] Player error: {error}')
-        asyncio.run_coroutine_threadsafe(self._advance(ctx), self.bot.loop)
+        asyncio.run_coroutine_threadsafe(self._advance(guild_id), self.bot.loop)
 
-    async def _advance(self, ctx: commands.Context):
-        p = self._player(ctx.guild)
+    async def _advance(self, guild_id: int):
+        p = get_player(guild_id)
         async with p._lock:
             if p.loop_mode == 'one' and p.current:
                 track = p.current
@@ -71,37 +90,78 @@ class Music(commands.Cog):
 
             if not track:
                 if p.autoplay and p.current:
-                    await self._autoplay_next(ctx, p)
+                    await self._autoplay_next(guild_id, p)
                     return
                 p.current = None
                 return
 
-            await self._play_track(ctx, p, track)
+            p.kick_predownload()
+            await self._play_track(guild_id, p, track)
 
-    async def _autoplay_next(self, ctx: commands.Context, p: GuildPlayer):
+    async def _autoplay_next(self, guild_id: int, p: GuildPlayer):
         if not p.current:
             return
-        related = await ytdl.search_ytmusic(p.current['title'], limit=5)
+        related = await ytdl.search_ytmusic(p.current['title'], limit=10)
+        related = [r for r in related if (r.get('duration') or 0) < 600]
         if not related:
             return
         pick = random.choice(related)
-        track = {**pick, 'requester': ctx.guild.me}
-        await self._play_track(ctx, p, track)
+        guild = self.bot.get_guild(guild_id)
+        track = {**pick, 'requester': guild.me if guild else None}
+        await self._play_track(guild_id, p, track)
 
-    async def _play_track(self, ctx: commands.Context, p: GuildPlayer, track: dict):
+    async def _play_track(self, guild_id: int, p: GuildPlayer, track: dict):
         file_path = await ytdl.download_and_get_path(track['url'], track.get('id'))
         if not file_path:
-            await ctx.send(embed=embeds.error(f"Couldn't download **{track['title']}**. Skipping."))
-            await self._advance(ctx)
+            if p.text_channel:
+                await p.text_channel.send(embed=embeds.error(f"Couldn't download **{track['title']}**. Skipping."))
+            await self._advance(guild_id)
             return
 
-        p.current = track
-        source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(file_path, options='-vn'),
-            volume=p.volume
-        )
-        p.voice_client.play(source, after=lambda e: self._after_play(ctx, e))
-        await ctx.send(embed=embeds.now_playing(track, track.get('requester')))
+        if not p.voice_client or not p.voice_client.is_connected():
+            return
+
+        try:
+            previous_title = p.current['title'] if p.current else None
+            p._predownload_tasks.pop(track.get('id'), None)
+            p.current = track
+            p.play_start_time = time.time()
+            source = discord.FFmpegOpusAudio(file_path, options=f'-af volume={p.volume}')
+            p.voice_client.play(source, after=lambda e: self._after_play(guild_id, e))
+
+            duration = track.get('duration', 0)
+            if duration > 15:
+                wakeup_secs = max(30, int(duration * 0.95))
+                agent_cog = self.bot.cogs.get('Agent')
+                if agent_cog and agent_cog.get_mode(guild_id) == 'mk2':
+                    agent_cog.schedule_auto_wakeup(
+                        guild_id, wakeup_secs,
+                        f'95% through "{track["title"]}" — queue up next songs if needed'
+                    )
+
+            if p.text_channel:
+                await p.text_channel.send(embed=embeds.now_playing(track, track.get('requester')))
+
+            requester = track.get('requester')
+            if requester and isinstance(requester, discord.Member) and not requester.bot:
+                from utils.database import log_play
+                asyncio.create_task(log_play(
+                    guild_id, requester.id, str(requester.display_name),
+                    track.get('id', ''), track['title'], track['url']
+                ))
+
+            if p.dj_mode:
+                asyncio.create_task(self._send_dj_comment(p, track['title'], previous_title))
+        except Exception as e:
+            print(f'[music] Playback error: {type(e).__name__}: {e}')
+            if p.text_channel:
+                await p.text_channel.send(embed=embeds.error(f'Playback failed: {e}'))
+
+    async def _send_dj_comment(self, p: GuildPlayer, current_title: str, previous_title: str = None):
+        from utils.gemini import dj_comment
+        comment = await dj_comment(current_title, previous_title)
+        if comment and p.text_channel:
+            await p.text_channel.send(f'🎙️ {comment}')
 
     # ──────────────────────────────── Commands ────────────────────────────────
 
@@ -111,31 +171,78 @@ class Music(commands.Cog):
         if not await self._ensure_voice(ctx):
             return
 
+        p = self._player(ctx.guild)
+        p.text_channel = ctx.channel
+
         async with ctx.typing():
-            # Resolve track info
             if query.startswith('http'):
                 info = await ytdl.extract_info(query)
+                if not info:
+                    await ctx.send(embed=embeds.error('Could not load that URL.'))
+                    return
+                await self._queue_or_play(ctx, info)
             else:
-                results = await ytdl.search_ytmusic(query, limit=1)
-                info = results[0] if results else None
+                results = await ytdl.search_ytmusic(query, limit=3)
+                if not results:
+                    await ctx.send(embed=embeds.error(f'Nothing found for `{query}`.'))
+                    return
 
-            if not info:
-                await ctx.send(embed=embeds.error(f'Nothing found for `{query}`.'))
+                if len(results) == 1:
+                    await self._queue_or_play(ctx, results[0])
+                    return
+
+                lines = [
+                    f"`{i}.` **{r['title']}** — {r.get('uploader', '?')} `{format_duration(r.get('duration', 0))}`"
+                    for i, r in enumerate(results, 1)
+                ]
+                e = discord.Embed(
+                    title=f'🔍 Results for "{query}"',
+                    description='\n'.join(lines),
+                    color=embeds.BLUE
+                )
+                e.set_footer(text='Reply with 1, 2, 3 — or yes / yup for the first one. Anything else cancels.')
+                search_msg = await ctx.send(embed=e)
+
+        if not query.startswith('http') and len(results) > 1:
+            def check(m):
+                return m.author == ctx.author and m.channel == ctx.channel
+
+            try:
+                reply = await self.bot.wait_for('message', timeout=30.0, check=check)
+            except asyncio.TimeoutError:
+                await search_msg.edit(embed=embeds.info('Search timed out.'))
                 return
 
-            track = {**info, 'requester': ctx.author}
-            p = self._player(ctx.guild)
+            content = reply.content.strip().lower()
 
-            if p.voice_client.is_playing() or p.voice_client.is_paused():
-                p.queue.append(track)
-                await ctx.send(embed=embeds.queued(track, len(p.queue), ctx.author))
+            if content in YES_WORDS:
+                pick = results[0]
+            elif content == '2' and len(results) >= 2:
+                pick = results[1]
+            elif content == '3' and len(results) >= 3:
+                pick = results[2]
+            elif content.isdigit() and 1 <= int(content) <= len(results):
+                pick = results[int(content) - 1]
             else:
-                async with p._lock:
-                    await self._play_track(ctx, p, track)
+                await ctx.send(embed=embeds.info('Search cancelled.'))
+                return
+
+            await self._queue_or_play(ctx, pick)
+
+    async def _queue_or_play(self, ctx: commands.Context, info: dict):
+        track = {**info, 'requester': ctx.author}
+        p = self._player(ctx.guild)
+        p.text_channel = ctx.channel
+        if p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()):
+            p.queue.append(track)
+            p.kick_predownload()
+            await ctx.send(embed=embeds.queued(track, len(p.queue), ctx.author))
+        else:
+            async with p._lock:
+                await self._play_track(ctx.guild.id, p, track)
 
     @commands.command(name='pause')
     async def pause(self, ctx: commands.Context):
-        """Pause playback."""
         p = self._player(ctx.guild)
         if p.voice_client and p.voice_client.is_playing():
             p.voice_client.pause()
@@ -145,7 +252,6 @@ class Music(commands.Cog):
 
     @commands.command(name='resume', aliases=['unpause'])
     async def resume(self, ctx: commands.Context):
-        """Resume playback."""
         p = self._player(ctx.guild)
         if p.voice_client and p.voice_client.is_paused():
             p.voice_client.resume()
@@ -155,7 +261,6 @@ class Music(commands.Cog):
 
     @commands.command(name='skip', aliases=['s', 'next'])
     async def skip(self, ctx: commands.Context):
-        """Skip the current song."""
         p = self._player(ctx.guild)
         if p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()):
             p.voice_client.stop()
@@ -165,7 +270,6 @@ class Music(commands.Cog):
 
     @commands.command(name='stop')
     async def stop(self, ctx: commands.Context):
-        """Stop playback, clear the queue, and leave voice."""
         p = self._player(ctx.guild)
         if p.voice_client:
             p.clear()
@@ -176,13 +280,11 @@ class Music(commands.Cog):
 
     @commands.command(name='queue', aliases=['q'])
     async def queue(self, ctx: commands.Context, page: int = 1):
-        """Show the current queue."""
         p = self._player(ctx.guild)
         await ctx.send(embed=embeds.queue_list(list(p.queue), p.current, page))
 
     @commands.command(name='nowplaying', aliases=['np', 'current'])
     async def nowplaying(self, ctx: commands.Context):
-        """Show what's currently playing."""
         p = self._player(ctx.guild)
         if p.current:
             await ctx.send(embed=embeds.now_playing(p.current, p.current.get('requester')))
@@ -191,19 +293,15 @@ class Music(commands.Cog):
 
     @commands.command(name='volume', aliases=['vol'])
     async def volume(self, ctx: commands.Context, vol: int):
-        """Set volume (0–100)."""
         if not 0 <= vol <= 100:
             await ctx.send(embed=embeds.error('Volume must be between 0 and 100.'))
             return
         p = self._player(ctx.guild)
         p.volume = vol / 100
-        if p.voice_client and p.voice_client.source:
-            p.voice_client.source.volume = p.volume
-        await ctx.send(embed=embeds.success(f'Volume set to **{vol}%**.'))
+        await ctx.send(embed=embeds.success(f'Volume set to **{vol}%**. Takes effect on next track.'))
 
     @commands.command(name='shuffle')
     async def shuffle(self, ctx: commands.Context):
-        """Shuffle the queue."""
         p = self._player(ctx.guild)
         if not p.queue:
             await ctx.send(embed=embeds.error('Queue is empty.'))
@@ -215,7 +313,6 @@ class Music(commands.Cog):
 
     @commands.command(name='loop')
     async def loop(self, ctx: commands.Context, mode: str = None):
-        """Toggle loop: off / one / all"""
         p = self._player(ctx.guild)
         if mode is None:
             modes = ['off', 'one', 'all']
@@ -231,15 +328,31 @@ class Music(commands.Cog):
 
     @commands.command(name='autoplay', aliases=['ap'])
     async def autoplay(self, ctx: commands.Context):
-        """Toggle autoplay (plays related songs when queue ends)."""
         p = self._player(ctx.guild)
         p.autoplay = not p.autoplay
         state = 'enabled' if p.autoplay else 'disabled'
         await ctx.send(embed=embeds.success(f'Autoplay **{state}**.'))
 
+    @commands.command(name='dj')
+    async def dj(self, ctx: commands.Context):
+        """Toggle DJ mode — Gemini reacts to each song as it plays."""
+        from utils.gemini import is_configured
+        if not is_configured():
+            await ctx.send(embed=embeds.error(
+                'DJ mode needs a Gemini API key.\n'
+                'Add `GEMINI_API_KEY=your_key` to your `.env`.\n'
+                'Get one free at <https://aistudio.google.com/>'
+            ))
+            return
+        p = self._player(ctx.guild)
+        p.dj_mode = not p.dj_mode
+        if p.dj_mode:
+            await ctx.send(embed=embeds.success('🎙️ DJ mode **on** — I\'ll react to every song.'))
+        else:
+            await ctx.send(embed=embeds.success('DJ mode **off**.'))
+
     @commands.command(name='remove', aliases=['rm'])
     async def remove(self, ctx: commands.Context, index: int):
-        """Remove a song from the queue by its position."""
         p = self._player(ctx.guild)
         if not p.queue or index < 1 or index > len(p.queue):
             await ctx.send(embed=embeds.error('Invalid queue position.'))
@@ -251,14 +364,12 @@ class Music(commands.Cog):
 
     @commands.command(name='clear', aliases=['clearqueue'])
     async def clear_queue(self, ctx: commands.Context):
-        """Clear the queue without stopping current song."""
         p = self._player(ctx.guild)
         p.queue.clear()
         await ctx.send(embed=embeds.success('Queue cleared.'))
 
     @commands.command(name='move')
     async def move(self, ctx: commands.Context, from_pos: int, to_pos: int):
-        """Move a song in the queue from one position to another."""
         p = self._player(ctx.guild)
         q = list(p.queue)
         if not (1 <= from_pos <= len(q)) or not (1 <= to_pos <= len(q)):
@@ -284,8 +395,10 @@ class Music(commands.Cog):
             random.shuffle(tracks)
 
         p = self._player(ctx.guild)
+        p.text_channel = ctx.channel
         for t in tracks:
             p.queue.append({**t, 'requester': ctx.author})
+        p.kick_predownload()
 
         playing_now = not (p.voice_client.is_playing() or p.voice_client.is_paused())
         msg = f'Added **{len(tracks)} tracks** to the queue.'
@@ -296,17 +409,15 @@ class Music(commands.Cog):
         if playing_now and p.queue:
             async with p._lock:
                 track = p.queue.popleft()
-                await self._play_track(ctx, p, track)
+                await self._play_track(ctx.guild.id, p, track)
 
     @commands.command(name='join')
     async def join(self, ctx: commands.Context):
-        """Join your voice channel."""
         await self._ensure_voice(ctx)
         await ctx.send(embed=embeds.success(f'Joined **{ctx.author.voice.channel.name}**.'))
 
     @commands.command(name='leave', aliases=['disconnect', 'dc'])
     async def leave(self, ctx: commands.Context):
-        """Leave the voice channel."""
         p = self._player(ctx.guild)
         if p.voice_client and p.voice_client.is_connected():
             p.clear()
@@ -325,7 +436,6 @@ class Music(commands.Cog):
             await ctx.send(embed=embeds.error('No results found.'))
             return
 
-        from utils.ytdl import format_duration
         lines = [
             f"`{i}.` **{r['title']}** — {r.get('uploader', '?')} `{format_duration(r.get('duration', 0))}`"
             for i, r in enumerate(results, 1)
