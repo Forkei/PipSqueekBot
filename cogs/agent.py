@@ -2,28 +2,35 @@
 PipSqueek Mk2 — Gemini-powered DJ agent.
 """
 import asyncio
+import json
 import os
+import re
+from collections import deque
 import discord
 from discord.ext import commands
 from google import genai
 from google.genai import types
 
-from utils.agent_tools import ToolContext, TOOLS, dispatch
+from utils.agent_tools import ToolContext, dispatch
 from utils.agent_context import build_context
 from utils import embeds
 
-# Bot prefix (duplicated here to avoid circular imports with bot.py)
 _PREFIX = os.getenv('BOT_PREFIX', 'pip').strip() + ' '
 
 _PROMPT_PATH = os.path.join(os.path.dirname(__file__), '..', 'system_prompt.md')
-_SYSTEM_PROMPT = open(_PROMPT_PATH, encoding='utf-8').read().replace('\\#', '#').replace('\\_', '_')
+_SYSTEM_PROMPT = re.sub(r'\\([^a-zA-Z0-9])', r'\1', open(_PROMPT_PATH, encoding='utf-8').read())
 
-MAX_TOOL_ROUNDS = 10
+MAX_TOOL_ROUNDS = 50
 _GEMINI_MODEL = 'gemini-3.1-pro-preview'
-_THINKING_BUDGET = 2000  # tokens Gemini uses to reason before acting
+_CONV_MAX_ENTRIES = 120  # trim oldest entries beyond this per guild
+
+_READ_ONLY_TOOLS = {
+    'done', 'get_queue', 'get_now_playing', 'search_songs',
+    'get_recent_history', 'get_user_history', 'list_playlists',
+    'retrieve_memory', 'list_memories', 'web_search',
+}
 
 _client: genai.Client | None = None
-
 
 
 def _get_gemini_client() -> genai.Client:
@@ -39,11 +46,21 @@ def _get_gemini_client() -> genai.Client:
 class Agent(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._mode: dict[int, str] = {}           # guild_id -> 'mk1' | 'mk2'
-        self._agent_channel: dict[int, int] = {}  # guild_id -> channel_id
-        self._wakeup_handles: dict[int, asyncio.TimerHandle] = {}       # agent-requested
-        self._auto_wakeup_handles: dict[int, asyncio.TimerHandle] = {}  # 95% song timer
-        self._running: set[int] = set()           # guilds with agent loop active
+        self._mode: dict[int, str] = {}
+        self._agent_channel: dict[int, int] = {}
+        self._wakeup_handles: dict[int, asyncio.TimerHandle] = {}
+        self._auto_wakeup_handles: dict[int, asyncio.TimerHandle] = {}
+        self._running: set[int] = set()
+        self._pending: dict[int, deque] = {}
+        self._conversations: dict[int, list] = {}  # guild_id -> Contents list
+
+    def _get_conversation(self, guild_id: int) -> list:
+        return self._conversations.setdefault(guild_id, [])
+
+    def _trim_conversation(self, guild_id: int):
+        conv = self._conversations.get(guild_id)
+        if conv and len(conv) > _CONV_MAX_ENTRIES:
+            self._conversations[guild_id] = conv[-_CONV_MAX_ENTRIES:]
 
     async def cog_load(self):
         from utils.database import load_all_guild_configs
@@ -130,21 +147,19 @@ class Agent(commands.Cog):
             return
 
         if guild_id in self._running:
-            print(f'[agent] already running, skip')
+            print(f'[agent] already running, queuing message')
+            self._pending.setdefault(guild_id, deque()).append(message)
             return
 
         print(f'[agent] triggering for: {message.content[:50]!r}')
         asyncio.create_task(self._run_agent(guild_id, message))
 
     def _should_trigger(self, message: discord.Message, guild_id: int) -> bool:
-        # In configured agent channel
         channel_id = self._agent_channel.get(guild_id)
         if channel_id and message.channel.id == channel_id:
             return True
-        # Bot mentioned
         if self.bot.user in message.mentions:
             return True
-        # Pip-prefixed
         if message.content.lower().startswith(_PREFIX.lower()):
             return True
         return False
@@ -156,28 +171,28 @@ class Agent(commands.Cog):
         if handle:
             handle.cancel()
 
-    def _schedule_wakeup(self, guild_id: int, seconds: int, reason: str):
+    def _schedule_wakeup(self, guild_id: int, seconds: int):
         self._cancel_wakeup(guild_id)
         loop = asyncio.get_event_loop()
         handle = loop.call_later(
             seconds,
-            lambda: asyncio.create_task(self._wakeup_fire(guild_id, reason))
+            lambda: asyncio.create_task(self._wakeup_fire(guild_id))
         )
         self._wakeup_handles[guild_id] = handle
 
-    def schedule_auto_wakeup(self, guild_id: int, seconds: int, reason: str):
-        """Called by music cog for the 95% song timer — separate from agent wakeups."""
+    def schedule_auto_wakeup(self, guild_id: int, seconds: int):
+        """Called by music cog for the 95% song timer."""
         handle = self._auto_wakeup_handles.pop(guild_id, None)
         if handle:
             handle.cancel()
         loop = asyncio.get_event_loop()
         handle = loop.call_later(
             seconds,
-            lambda: asyncio.create_task(self._wakeup_fire(guild_id, reason))
+            lambda: asyncio.create_task(self._wakeup_fire(guild_id))
         )
         self._auto_wakeup_handles[guild_id] = handle
 
-    async def _wakeup_fire(self, guild_id: int, reason: str):
+    async def _wakeup_fire(self, guild_id: int):
         self._wakeup_handles.pop(guild_id, None)
         if self.get_mode(guild_id) != 'mk2':
             return
@@ -192,7 +207,7 @@ class Agent(commands.Cog):
         channel = guild.get_channel(channel_id)
         if not channel:
             return
-        await self._run_agent(guild_id, message=None, wakeup_reason=reason, channel_override=channel)
+        await self._run_agent(guild_id, message=None, is_wakeup=True, channel_override=channel)
 
     # ─── Core agent loop ───────────────────────────────────────────────────────
 
@@ -200,7 +215,7 @@ class Agent(commands.Cog):
         self,
         guild_id: int,
         message: discord.Message | None,
-        wakeup_reason: str | None = None,
+        is_wakeup: bool = False,
         channel_override: discord.TextChannel | None = None,
     ):
         if guild_id in self._running:
@@ -208,24 +223,27 @@ class Agent(commands.Cog):
         self._running.add(guild_id)
 
         try:
-            await self._agent_loop(guild_id, message, wakeup_reason, channel_override)
+            await self._agent_loop(guild_id, message, is_wakeup, channel_override)
         except Exception as e:
             print(f'[agent] Unhandled error in guild {guild_id}: {type(e).__name__}: {e}')
         finally:
             self._running.discard(guild_id)
+            pending = self._pending.get(guild_id)
+            if pending:
+                next_msg = pending.popleft()
+                asyncio.create_task(self._run_agent(guild_id, next_msg))
 
     async def _agent_loop(
         self,
         guild_id: int,
         message: discord.Message | None,
-        wakeup_reason: str | None,
+        is_wakeup: bool,
         channel_override: discord.TextChannel | None,
     ):
         guild = self.bot.get_guild(guild_id)
         if not guild:
             return
 
-        # Determine channel and author
         if message:
             channel = message.channel
             author = message.author
@@ -235,7 +253,6 @@ class Agent(commands.Cog):
         else:
             return
 
-        # Build ToolContext
         tc = ToolContext(
             guild=guild,
             channel=channel,
@@ -244,19 +261,25 @@ class Agent(commands.Cog):
             trigger_message=message,
         )
 
-        # Build context string
-        ctx_str = await build_context(guild, author, message, wakeup_reason)
+        # Append trigger to in-memory conversation and save to DB
+        from utils.database import save_conversation_turn, upsert_user
+        conv = self._get_conversation(guild_id)
 
-        # Save user message to conversation history and update user name mapping
         if message and author:
-            from utils.database import save_conversation_turn, upsert_user
             await upsert_user(guild_id, author.id, author.display_name)
-            await save_conversation_turn(
-                guild_id, 'user',
-                message.content[:500],
-                author.display_name,
-                author.id,
-            )
+            trigger = {
+                'type': 'user_message',
+                'username': author.display_name,
+                'text': message.content,
+                'uuid': str(message.id),
+            }
+            await save_conversation_turn(guild_id, 'user', message.content[:500], author.display_name, author.id)
+        else:
+            trigger = {'type': 'wakeup'}
+            await save_conversation_turn(guild_id, 'system', '[wakeup]')
+
+        conv.append(types.Content(role='user', parts=[types.Part(text=json.dumps(trigger))]))
+        self._trim_conversation(guild_id)
 
         try:
             client = _get_gemini_client()
@@ -264,9 +287,7 @@ class Agent(commands.Cog):
             return
 
         async with channel.typing():
-            await self._agent_turns(
-                guild_id, guild, channel, author, message, wakeup_reason, tc, ctx_str, client
-            )
+            await self._agent_turns(guild_id, guild, channel, author, tc, client)
 
     async def _agent_turns(
         self,
@@ -274,117 +295,127 @@ class Agent(commands.Cog):
         guild: discord.Guild,
         channel,
         author,
-        message,
-        wakeup_reason,
-        tc: 'ToolContext',
-        ctx_str: str,
+        tc: ToolContext,
         client,
     ):
-        contents = [types.Content(role='user', parts=[types.Part(text=ctx_str)])]
-
-        pending_errors: list[str] = []  # errors from tools not yet surfaced to user
-        message_sent = False            # tracks whether send_message was called this turn
+        action_log: list[str] = []
+        message_sent = False
+        pending_errors: list[str] = []
 
         for _round in range(MAX_TOOL_ROUNDS):
+            # Rebuild system instruction with fresh status before every LLM call
+            status = await build_context(guild, author)
+            system_instruction = _SYSTEM_PROMPT + '\n\n' + status
+
+            conv = self._get_conversation(guild_id)
+
             try:
                 response = await client.aio.models.generate_content(
                     model=_GEMINI_MODEL,
-                    contents=contents,
+                    contents=conv,
                     config=types.GenerateContentConfig(
-                        system_instruction=_SYSTEM_PROMPT,
-                        tools=TOOLS,
-                        tool_config=types.ToolConfig(
-                            function_calling_config=types.FunctionCallingConfig(mode='AUTO')
-                        ),
-                        thinking_config=types.ThinkingConfig(thinking_budget=_THINKING_BUDGET),
-                        temperature=1.0,
+                        system_instruction=system_instruction,
+                        response_mime_type='application/json',
+                        temperature=0.6,
                         max_output_tokens=8000,
                     )
                 )
             except Exception as e:
                 print(f'[agent] Gemini error: {type(e).__name__}: {e}')
-                if _round == 0 and message:
-                    await channel.send(f'something went wrong on my end ({type(e).__name__})')
+                if _round == 0:
+                    await channel.send(f'something went wrong ({type(e).__name__})')
                 break
 
             candidate = response.candidates[0] if response.candidates else None
             if not candidate:
-                print(f'[agent] no candidate in response')
-                if _round == 0 and message:
-                    await channel.send('got a blank response, try again')
+                print('[agent] no candidate in response')
                 break
 
             parts = candidate.content.parts if candidate.content else []
+            text = ''.join(p.text for p in parts if p.text)
 
-            # Collect function calls and text from this response
-            func_calls = [p for p in parts if p.function_call]
-            text_parts = [p.text for p in parts if p.text and p.text.strip()]
-            print(f'[agent] round {_round}: {len(func_calls)} func_calls, {len(text_parts)} text_parts, finish={candidate.finish_reason}')
-            for fc in func_calls:
-                print(f'  -> call: {fc.function_call.name}({dict(fc.function_call.args) if fc.function_call.args else {}})')
-            for t in text_parts:
-                print(f'  -> text: {t[:80]!r}')
+            # Append model response to conversation
+            conv.append(candidate.content)
+            self._trim_conversation(guild_id)
 
-            if not func_calls and not text_parts:
+            # Parse JSON
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as e:
+                print(f'[agent] JSON parse error: {e} | text: {text[:300]}')
+                if _round == 0:
+                    await channel.send('got a malformed response, try again')
                 break
 
-            # If no function calls, agent is just sending text
-            if not func_calls:
-                text = ' '.join(text_parts)
-                if text:
-                    await channel.send(text)
-                    from utils.database import save_conversation_turn
-                    await save_conversation_turn(guild_id, 'model', text[:500])
+            thought = data.get('thought', '')
+            tools_list = data.get('tools', [])
+
+            print(f'[agent] round {_round} | thought: {thought[:80]!r}')
+            for t in tools_list:
+                print(f'  -> {t.get("name")}({t.get("args", {})})')
+
+            if not tools_list:
+                print('[agent] no tools in response — stopping')
                 break
 
-            # Execute all function calls
-            function_responses = []
+            # Execute each tool and collect results
+            tool_result_parts: list[types.Part] = []
             is_done = False
 
-            for fc in func_calls:
-                name = fc.function_call.name
-                args = dict(fc.function_call.args) if fc.function_call.args else {}
+            for tool_call in tools_list:
+                name = tool_call.get('name', '')
+                args = tool_call.get('args') or {}
+                if not isinstance(args, dict):
+                    args = {}
+
                 result = await dispatch(name, args, tc)
+
+                tool_result_parts.append(types.Part(text=json.dumps({
+                    'type': 'tool_result',
+                    'tool': name,
+                    'result': result,
+                })))
 
                 if name == 'done':
                     is_done = True
                 elif name == 'send_message':
                     message_sent = True
                     pending_errors.clear()
+                    action_log.append(f'said: {args.get("content", "")[:200]}')
+                elif name == 'add_reaction':
+                    action_log.append(f'reacted: {args.get("emoji", "")}')
+                elif name not in _READ_ONLY_TOOLS:
+                    if isinstance(result, str) and result.startswith('error:'):
+                        pending_errors.append(result[6:].strip())
+                        action_log.append(f'error({name}): {result[6:].strip()[:100]}')
+                    else:
+                        action_log.append(result[:150] if isinstance(result, str) else name)
                 elif isinstance(result, str) and result.startswith('error:'):
                     pending_errors.append(result[6:].strip())
 
-                function_responses.append(
-                    types.Part.from_function_response(
-                        name=name, response={'result': result}
-                    )
-                )
+            # Append all tool results as one user turn
+            if tool_result_parts:
+                conv.append(types.Content(role='user', parts=tool_result_parts))
+                self._trim_conversation(guild_id)
 
-            # Append model turn + tool results for next round
-            contents.append(candidate.content)
-            contents.append(types.Content(role='user', parts=function_responses))
-
-            # Handle wakeup scheduling/cancellation from this round
+            # Handle wakeup scheduling
             if tc._wakeup_cancel:
                 tc._wakeup_cancel = False
                 self._cancel_wakeup(guild_id)
             elif tc._wakeup_scheduled:
                 tc._wakeup_scheduled = False
-                self._schedule_wakeup(guild_id, tc._wakeup_seconds, tc._wakeup_reason)
+                self._schedule_wakeup(guild_id, tc._wakeup_seconds)
 
             if is_done:
-                if text_parts:
-                    text = ' '.join(text_parts)
-                    await channel.send(text)
-                    from utils.database import save_conversation_turn
-                    await save_conversation_turn(guild_id, 'model', text[:500])
-                elif pending_errors and not message_sent:
-                    # Agent called done() without surfacing tool errors — post them as fallback
-                    err_text = ' | '.join(pending_errors)
-                    await channel.send(f'⚠️ {err_text}')
+                if pending_errors and not message_sent:
+                    await channel.send(f'⚠️ {" | ".join(pending_errors)}')
                 break
         else:
             print(f'[agent] Hit max tool rounds ({MAX_TOOL_ROUNDS}) for guild {guild_id}')
+
+        if action_log:
+            from utils.database import save_conversation_turn
+            await save_conversation_turn(guild_id, 'model', ' | '.join(action_log)[:500])
 
 
 async def setup(bot: commands.Bot):

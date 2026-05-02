@@ -1,5 +1,5 @@
 """
-Tool definitions and implementations for the PipSqueek Mk2 agent.
+Tool implementations for the PipSqueek Mk2 agent.
 """
 import asyncio
 import random
@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import discord
-from google.genai import types
 
 if TYPE_CHECKING:
     from discord.ext import commands
@@ -23,230 +22,7 @@ class ToolContext:
     trigger_message: discord.Message | None = None
     _wakeup_scheduled: bool = field(default=False, init=False)
     _wakeup_seconds: int = field(default=0, init=False)
-    _wakeup_reason: str = field(default='', init=False)
     _wakeup_cancel: bool = field(default=False, init=False)
-
-
-# ─── Tool Declarations (Gemini function calling) ───────────────────────────────
-
-def _p(*required, **props):
-    """Helper: build parameters_json_schema."""
-    return {
-        'type': 'object',
-        'properties': {k: v for k, v in props.items()},
-        **({'required': list(required)} if required else {}),
-    }
-
-
-def _str(desc): return {'type': 'string', 'description': desc}
-def _int(desc): return {'type': 'integer', 'description': desc}
-def _bool(desc): return {'type': 'boolean', 'description': desc}
-
-
-TOOL_DECLARATIONS = [
-    types.FunctionDeclaration(
-        name='play_song',
-        description=(
-            'Search YouTube for a song and queue it. Joins voice automatically. '
-            'Filters out results over 10 min. Use search_songs first when the title '
-            'is ambiguous or you want to verify the exact track before committing.'
-        ),
-        parameters_json_schema=_p('query', query=_str('Song name, "Artist - Title", or YouTube URL')),
-    ),
-    types.FunctionDeclaration(
-        name='skip_song',
-        description='Skip the currently playing song.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='pause_playback',
-        description='Pause the current song.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='resume_playback',
-        description='Resume a paused song.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='stop_and_leave',
-        description='Stop playback, clear queue, disconnect from voice.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='set_volume',
-        description='Set playback volume 0-100.',
-        parameters_json_schema=_p('volume', volume=_int('Volume level 0-100')),
-    ),
-    types.FunctionDeclaration(
-        name='shuffle_queue',
-        description='Shuffle the current queue.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='set_loop_mode',
-        description='Set loop mode.',
-        parameters_json_schema=_p('mode', mode=_str('One of: off, one, all')),
-    ),
-    types.FunctionDeclaration(
-        name='toggle_autoplay',
-        description='Toggle autoplay of related songs when queue ends.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='clear_queue',
-        description='Clear all queued songs without stopping the current song.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='remove_from_queue',
-        description='Remove a song by 1-based queue position.',
-        parameters_json_schema=_p('position', position=_int('Queue position (1-based)')),
-    ),
-    types.FunctionDeclaration(
-        name='move_in_queue',
-        description='Move a song from one queue position to another.',
-        parameters_json_schema=_p('from_pos', 'to_pos',
-            from_pos=_int('Source position (1-based)'),
-            to_pos=_int('Destination position (1-based)'),
-        ),
-    ),
-    types.FunctionDeclaration(
-        name='join_voice',
-        description="Join the requesting user's voice channel.",
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='leave_voice',
-        description='Leave the current voice channel.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='get_queue',
-        description='Get the current queue contents.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='get_now_playing',
-        description='Get info about the currently playing song.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='search_songs',
-        description=(
-            'Search YouTube for songs WITHOUT playing them. Use this to find the right track '
-            'before play_song — especially when a title is ambiguous or you need to confirm '
-            'a song exists before queuing it.'
-        ),
-        parameters_json_schema=_p('query',
-            query=_str('Search query'),
-            limit=_int('Number of results (1-5, default 3)'),
-        ),
-    ),
-    types.FunctionDeclaration(
-        name='create_playlist',
-        description='Create a new server playlist.',
-        parameters_json_schema=_p('name', name=_str('Playlist name')),
-    ),
-    types.FunctionDeclaration(
-        name='list_playlists',
-        description='List all playlists on this server.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='play_playlist',
-        description='Queue all songs from a playlist. ONLY use IDs returned by list_playlists() — never invent or guess an ID.',
-        parameters_json_schema=_p('playlist_id',
-            playlist_id=_str('Playlist ID from list_playlists()'),
-            shuffle=_bool('Shuffle before queuing'),
-        ),
-    ),
-    types.FunctionDeclaration(
-        name='add_to_playlist',
-        description='Add a song to a playlist.',
-        parameters_json_schema=_p('playlist_id', 'query',
-            playlist_id=_str('Playlist ID'),
-            query=_str('Song name or YouTube URL'),
-        ),
-    ),
-    types.FunctionDeclaration(
-        name='get_recent_history',
-        description='Get recently played songs on this server.',
-        parameters_json_schema=_p(limit=_int('Number of songs (default 10)')),
-    ),
-    types.FunctionDeclaration(
-        name='get_user_history',
-        description="Get a specific user's play history.",
-        parameters_json_schema=_p('user_name',
-            user_name=_str('Display name of the user'),
-            limit=_int('Number of songs (default 10)'),
-        ),
-    ),
-    types.FunctionDeclaration(
-        name='store_memory',
-        description='Store a persistent note about a user, preference, or pattern.',
-        parameters_json_schema=_p('key', 'value',
-            key=_str('Memory key (e.g. user_alice_likes_jazz)'),
-            value=_str('Memory value'),
-        ),
-    ),
-    types.FunctionDeclaration(
-        name='retrieve_memory',
-        description='Retrieve a stored memory by key.',
-        parameters_json_schema=_p('key', key=_str('Memory key')),
-    ),
-    types.FunctionDeclaration(
-        name='list_memories',
-        description='List all stored memory keys and values.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='schedule_wakeup',
-        description='Schedule a proactive wakeup to check in later.',
-        parameters_json_schema=_p('seconds', 'reason',
-            seconds=_int('Seconds until wakeup (60-3600)'),
-            reason=_str('Why you want to wake up (you will see this)'),
-        ),
-    ),
-    types.FunctionDeclaration(
-        name='cancel_wakeup',
-        description='Cancel any pending wakeup timer.',
-        parameters_json_schema=_p(),
-    ),
-    types.FunctionDeclaration(
-        name='send_message',
-        description='Send a text message to the channel.',
-        parameters_json_schema=_p('content', content=_str('Message content (keep it short)')),
-    ),
-    types.FunctionDeclaration(
-        name='add_reaction',
-        description='Add an emoji reaction to the triggering message.',
-        parameters_json_schema=_p('emoji', emoji=_str('Emoji to react with')),
-    ),
-    types.FunctionDeclaration(
-        name='poll',
-        description='Post a quick song vote in the channel. Sends a message with emoji options (1️⃣/2️⃣/3️⃣) for users to react to.',
-        parameters_json_schema=_p('question', 'options',
-            question=_str('The poll question'),
-            options=_str('Comma-separated list of options (2-3 max)'),
-        ),
-    ),
-    types.FunctionDeclaration(
-        name='web_search',
-        description=(
-            'Search the web for real-time information: new releases, tour dates, artist info, '
-            'lyrics, music news. Use when you need current info not in your training data.'
-        ),
-        parameters_json_schema=_p('query', query=_str('Search query')),
-    ),
-    types.FunctionDeclaration(
-        name='done',
-        description='Signal that you are done. Must be called at the end of every turn.',
-        parameters_json_schema=_p(),
-    ),
-]
-
-TOOLS = [types.Tool(function_declarations=TOOL_DECLARATIONS)]
 
 
 # ─── Tool Implementations ──────────────────────────────────────────────────────
@@ -292,18 +68,19 @@ async def play_song(tc: ToolContext, query: str) -> str:
         results = await ytdl.search_ytmusic(query, limit=5)
         info = next((r for r in results if r.get('duration', 0) <= _MAX_PLAY_DURATION), None)
         if not info and results:
-            # All results were long — just take the shortest one anyway
             info = min(results, key=lambda r: r.get('duration', 9999))
 
     if not info:
         return f'error: nothing found for "{query}"'
 
-    # Skip if this title was played in the last 20 songs
-    from utils.database import get_play_history
-    recent = await get_play_history(tc.guild.id, limit=20)
-    recent_titles = {r['title'].lower() for r in recent}
-    if info['title'].lower() in recent_titles:
-        return f'skipped: "{info["title"]}" was recently played'
+    # Dedup only for non-user-initiated plays (wakeups, autoplay)
+    user_initiated = tc.author is not None and tc.trigger_message is not None
+    if not user_initiated:
+        from utils.database import get_play_history
+        recent = await get_play_history(tc.guild.id, limit=20)
+        recent_titles = {r['title'].lower() for r in recent}
+        if info['title'].lower() in recent_titles:
+            return f'skipped: "{info["title"]}" was recently played'
 
     track = {**info, 'requester': tc.author or tc.guild.me}
 
@@ -603,7 +380,6 @@ async def get_user_history(tc: ToolContext, user_name: str, limit: int = 10) -> 
     if user_id:
         rows = await get_user_play_history(tc.guild.id, user_id, limit)
     else:
-        # Fallback: name-match in play_history for users seen before the users table existed
         all_rows = await get_play_history(tc.guild.id, 200)
         rows = [r for r in all_rows if r['user_name'].lower() == user_name.lower()][:limit]
     if not rows:
@@ -615,7 +391,6 @@ async def get_user_history(tc: ToolContext, user_name: str, limit: int = 10) -> 
 async def store_memory(tc: ToolContext, key: str, value: str) -> str:
     from utils.database import store_memory as db_store, store_taste_profile
     await db_store(tc.guild.id, key, value)
-    # If the key references a user and describes a taste/preference, update taste profile too
     taste_keywords = ('likes', 'loves', 'hates', 'prefers', 'genre', 'mood', 'vibe', 'taste', 'favorite', 'fan')
     if tc.author and any(kw in key.lower() or kw in value.lower() for kw in taste_keywords):
         await store_taste_profile(tc.guild.id, tc.author.id, value)
@@ -638,12 +413,11 @@ async def list_memories(tc: ToolContext) -> str:
     return '\n'.join(f'{k}: {v}' for k, v in memories)
 
 
-async def schedule_wakeup(tc: ToolContext, seconds: int, reason: str) -> str:
+async def schedule_wakeup(tc: ToolContext, seconds: int) -> str:
     seconds = max(60, min(3600, seconds))
     tc._wakeup_scheduled = True
     tc._wakeup_seconds = seconds
-    tc._wakeup_reason = reason
-    return f'wakeup scheduled in {seconds}s: {reason}'
+    return f'wakeup scheduled in {seconds}s'
 
 
 async def cancel_wakeup(tc: ToolContext) -> str:
@@ -682,9 +456,7 @@ async def poll(tc: ToolContext, question: str, options: str) -> str:
 
 
 async def web_search(tc: ToolContext, query: str) -> str:
-    """Search DuckDuckGo and return the top result snippets."""
     import aiohttp
-    import urllib.parse
     url = 'https://api.duckduckgo.com/'
     params = {'q': query, 'format': 'json', 'no_html': '1', 'skip_disambig': '1'}
     try:

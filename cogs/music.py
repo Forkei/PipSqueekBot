@@ -134,10 +134,7 @@ class Music(commands.Cog):
                 wakeup_secs = max(30, int(duration * 0.95))
                 agent_cog = self.bot.cogs.get('Agent')
                 if agent_cog and agent_cog.get_mode(guild_id) == 'mk2':
-                    agent_cog.schedule_auto_wakeup(
-                        guild_id, wakeup_secs,
-                        f'95% through "{track["title"]}" — queue up next songs if needed'
-                    )
+                    agent_cog.schedule_auto_wakeup(guild_id, wakeup_secs)
 
             if p.text_channel:
                 await p.text_channel.send(embed=embeds.now_playing(track, track.get('requester')))
