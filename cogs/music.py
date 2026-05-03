@@ -163,6 +163,7 @@ class Music(commands.Cog):
                         p.now_playing_msg = await p.text_channel.send(embed=embed)
                     try:
                         await p.now_playing_msg.add_reaction('❤️')
+                        await p.now_playing_msg.add_reaction('⏸️')
                         await p.now_playing_msg.add_reaction('⏭️')
                     except Exception:
                         pass
@@ -526,6 +527,12 @@ class Music(commands.Cog):
         elif emoji == '⏭️':
             if p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()):
                 p.voice_client.stop()
+
+        elif emoji == '⏸️':
+            if p.voice_client and p.voice_client.is_playing():
+                p.voice_client.pause()
+            elif p.voice_client and p.voice_client.is_paused():
+                p.voice_client.resume()
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
