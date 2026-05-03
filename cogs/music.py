@@ -519,10 +519,6 @@ class Music(commands.Cog):
                 payload.guild_id, payload.user_id, user_name,
                 track.get('id', ''), track['title'], track['url']
             )
-            try:
-                await p.now_playing_msg.add_reaction('💜')
-            except Exception:
-                pass
 
         elif emoji == '⏭️':
             if p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()):
