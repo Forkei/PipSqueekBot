@@ -89,14 +89,17 @@ class Music(commands.Cog):
                 track = p.queue.popleft() if p.queue else None
 
             if not track:
-                if p.autoplay and p.current:
-                    await self._autoplay_next(guild_id, p)
+                do_autoplay = p.autoplay and p.current
+                if not do_autoplay:
+                    p.current = None
                     return
-                p.current = None
-                return
 
-            p.kick_predownload()
-            await self._play_track(guild_id, p, track)
+        if do_autoplay:
+            await self._autoplay_next(guild_id, p)
+            return
+
+        p.kick_predownload()
+        await self._play_track(guild_id, p, track)
 
     async def _autoplay_next(self, guild_id: int, p: GuildPlayer):
         if not p.current:

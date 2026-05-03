@@ -347,6 +347,10 @@ class Agent(commands.Cog):
                     await channel.send('got a malformed response, try again')
                 break
 
+            if not isinstance(data, dict):
+                print(f'[agent] unexpected JSON type {type(data).__name__}: {text[:200]}')
+                break
+
             thought = data.get('thought', '')
             tools_list = data.get('tools', [])
 

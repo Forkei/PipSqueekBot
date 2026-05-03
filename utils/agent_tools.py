@@ -89,13 +89,17 @@ async def play_song(tc: ToolContext, query: str) -> str:
         return 'error: music cog not loaded'
 
     async with p._lock:
-        if p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()):
+        play_immediately = not (p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()))
+        if not play_immediately:
             p.queue.append(track)
             p.kick_predownload()
-            return f'queued: "{info["title"]}" at position #{len(p.queue)}'
-        else:
-            await music_cog._play_track(tc.guild.id, p, track)
-            return f'playing: "{info["title"]}"'
+            queue_pos = len(p.queue)
+
+    if play_immediately:
+        await music_cog._play_track(tc.guild.id, p, track)
+        return f'playing: "{info["title"]}"'
+    else:
+        return f'queued: "{info["title"]}" at position #{queue_pos}'
 
 
 async def skip_song(tc: ToolContext) -> str:
