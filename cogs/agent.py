@@ -1,5 +1,5 @@
 """
-PipSqueek Mk2 — Gemini-powered DJ agent.
+PipSqueek Mk2 — Gemini-powered DJ agent (streaming ReAct).
 """
 import asyncio
 import json
@@ -20,9 +20,32 @@ _PREFIX = os.getenv('BOT_PREFIX', 'pip').strip() + ' '
 _PROMPT_PATH = os.path.join(os.path.dirname(__file__), '..', 'system_prompt.md')
 _SYSTEM_PROMPT = re.sub(r'\\([^a-zA-Z0-9])', r'\1', open(_PROMPT_PATH, encoding='utf-8').read())
 
-MAX_TOOL_ROUNDS = 50
+MAX_ITERATIONS = 50
 _GEMINI_MODEL = 'gemini-3.1-pro-preview'
-_CONV_MAX_ENTRIES = 120  # trim oldest entries beyond this per guild
+_CONV_MAX_ENTRIES = 240  # more entries now — each tool call is 2 turns
+
+# Tools whose single positional arg maps to this kwarg name
+_SINGLE_PARAM = {
+    'play_song': 'query',
+    'send_message': 'content',
+    'add_reaction': 'emoji',
+    'set_volume': 'volume',
+    'search_songs': 'query',
+    'create_playlist': 'name',
+    'play_playlist': 'playlist_id',
+    'add_to_playlist': 'query',
+    'get_recent_history': 'limit',
+    'get_user_history': 'user_name',
+    'store_memory': 'key',
+    'retrieve_memory': 'key',
+    'schedule_wakeup': 'seconds',
+    'remove_from_queue': 'position',
+    'set_loop_mode': 'mode',
+    'web_search': 'query',
+    'poll': 'question',
+}
+
+_TOOL_RE = re.compile(r'^\$([a-z_]+)\((.*)\)\$$', re.DOTALL)
 
 _READ_ONLY_TOOLS = {
     'done', 'get_queue', 'get_now_playing', 'search_songs',
@@ -43,6 +66,28 @@ def _get_gemini_client() -> genai.Client:
     return _client
 
 
+def _parse_tool_call(text: str) -> tuple[str, dict] | None:
+    """Parse '$tool_name(args)$'. Returns (name, kwargs) or None."""
+    m = _TOOL_RE.match(text)
+    if not m:
+        return None
+    name = m.group(1)
+    args_str = m.group(2).strip()
+    if not args_str:
+        return name, {}
+    try:
+        parsed = json.loads(args_str)
+        if isinstance(parsed, dict):
+            return name, parsed
+        # Single primitive value — map to first param
+        param = _SINGLE_PARAM.get(name)
+        if param:
+            return name, {param: parsed}
+        return name, {}
+    except json.JSONDecodeError:
+        return None
+
+
 class Agent(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -52,7 +97,7 @@ class Agent(commands.Cog):
         self._auto_wakeup_handles: dict[int, asyncio.TimerHandle] = {}
         self._running: set[int] = set()
         self._pending: dict[int, deque] = {}
-        self._conversations: dict[int, list] = {}  # guild_id -> Contents list
+        self._conversations: dict[int, list] = {}
 
     def _get_conversation(self, guild_id: int) -> list:
         return self._conversations.setdefault(guild_id, [])
@@ -261,7 +306,6 @@ class Agent(commands.Cog):
             trigger_message=message,
         )
 
-        # Append trigger to in-memory conversation and save to DB
         from utils.database import save_conversation_turn, upsert_user
         conv = self._get_conversation(guild_id)
 
@@ -289,6 +333,45 @@ class Agent(commands.Cog):
         async with channel.typing():
             await self._agent_turns(guild_id, guild, channel, author, tc, client)
 
+    # ─── Streaming ReAct loop ──────────────────────────────────────────────────
+
+    async def _consume_until_tool(self, stream) -> tuple[str, str | None, dict]:
+        """
+        Read stream until a complete $tool(args)$ is found or stream ends.
+        Returns (text_accumulated_including_tool_call, tool_name_or_None, args_dict).
+        The tool call syntax is included at the end of the returned text.
+        """
+        buf = ""       # all text so far (before + tool call)
+        tool_buf = ""  # current potential tool call being built
+        in_tool = False
+
+        try:
+            async for chunk in stream:
+                for ch in (chunk.text or ""):
+                    if not in_tool:
+                        if ch == '$':
+                            in_tool = True
+                            tool_buf = '$'
+                        else:
+                            buf += ch
+                    else:
+                        tool_buf += ch
+                        # Complete tool call ends with )$
+                        if ch == '$' and len(tool_buf) > 3 and tool_buf[-2] == ')':
+                            parsed = _parse_tool_call(tool_buf)
+                            if parsed:
+                                name, args = parsed
+                                return buf + tool_buf, name, args
+                            else:
+                                # Not a valid tool, treat as plain text
+                                buf += tool_buf
+                                tool_buf = ""
+                                in_tool = False
+        except Exception as e:
+            print(f'[agent] stream error: {type(e).__name__}: {e}')
+
+        return buf + tool_buf, None, {}
+
     async def _agent_turns(
         self,
         guild_id: int,
@@ -302,107 +385,57 @@ class Agent(commands.Cog):
         message_sent = False
         pending_errors: list[str] = []
 
-        for _round in range(MAX_TOOL_ROUNDS):
-            # Rebuild system instruction with fresh status before every LLM call
+        conv = self._get_conversation(guild_id)
+        assistant_text = ""  # grows into one big model message
+
+        for _iter in range(MAX_ITERATIONS):
             status = await build_context(guild, author)
             system_instruction = _SYSTEM_PROMPT + '\n\n' + status
 
-            conv = self._get_conversation(guild_id)
+            # Pass conversation + current partial assistant turn as prefix
+            contents = list(conv)
+            if assistant_text:
+                contents.append(types.Content(
+                    role='model',
+                    parts=[types.Part(text=assistant_text)]
+                ))
 
             try:
-                response = await client.aio.models.generate_content(
+                stream = await client.aio.models.generate_content_stream(
                     model=_GEMINI_MODEL,
-                    contents=conv,
+                    contents=contents,
                     config=types.GenerateContentConfig(
                         system_instruction=system_instruction,
-                        response_mime_type='application/json',
                         temperature=0.6,
                         max_output_tokens=8000,
                     )
                 )
             except Exception as e:
                 print(f'[agent] Gemini error: {type(e).__name__}: {e}')
-                if _round == 0:
+                if _iter == 0:
                     await channel.send(f'something went wrong ({type(e).__name__})')
                 break
 
-            candidate = response.candidates[0] if response.candidates else None
-            if not candidate:
-                print('[agent] no candidate in response')
+            new_text, tool_name, tool_args = await self._consume_until_tool(stream)
+            assistant_text += new_text
+
+            if not tool_name:
+                print(f'[agent] iter {_iter} — stream ended without tool call')
                 break
 
-            parts = candidate.content.parts if candidate.content else []
-            text = ''.join(p.text for p in parts if p.text)
+            print(f'[agent] iter {_iter} | {tool_name}({tool_args})')
 
-            # Append model response to conversation
-            conv.append(candidate.content)
-            self._trim_conversation(guild_id)
-
-            # Parse JSON
-            try:
-                data = json.loads(text)
-            except json.JSONDecodeError as e:
-                print(f'[agent] JSON parse error: {e} | text: {text[:300]}')
-                if _round == 0:
-                    await channel.send('got a malformed response, try again')
+            if tool_name == 'done':
+                if pending_errors and not message_sent:
+                    await channel.send(f'⚠️ {" | ".join(pending_errors)}')
                 break
 
-            if not isinstance(data, dict):
-                print(f'[agent] unexpected JSON type {type(data).__name__}: {text[:200]}')
-                break
+            result = await dispatch(tool_name, tool_args, tc)
 
-            thought = data.get('thought', '')
-            tools_list = data.get('tools', [])
+            # Append result inline — stays part of the single model message
+            assistant_text += f'[{result}]'
 
-            print(f'[agent] round {_round} | thought: {thought[:80]!r}')
-            for t in tools_list:
-                print(f'  -> {t.get("name")}({t.get("args", {})})')
-
-            if not tools_list:
-                print('[agent] no tools in response — stopping')
-                break
-
-            # Execute each tool and collect results
-            tool_result_parts: list[types.Part] = []
-            is_done = False
-
-            for tool_call in tools_list:
-                name = tool_call.get('name', '')
-                args = tool_call.get('args') or {}
-                if not isinstance(args, dict):
-                    args = {}
-
-                result = await dispatch(name, args, tc)
-
-                tool_result_parts.append(types.Part(text=json.dumps({
-                    'type': 'tool_result',
-                    'tool': name,
-                    'result': result,
-                })))
-
-                if name == 'done':
-                    is_done = True
-                elif name == 'send_message':
-                    message_sent = True
-                    pending_errors.clear()
-                    action_log.append(f'said: {args.get("content", "")[:200]}')
-                elif name == 'add_reaction':
-                    action_log.append(f'reacted: {args.get("emoji", "")}')
-                elif name not in _READ_ONLY_TOOLS:
-                    if isinstance(result, str) and result.startswith('error:'):
-                        pending_errors.append(result[6:].strip())
-                        action_log.append(f'error({name}): {result[6:].strip()[:100]}')
-                    else:
-                        action_log.append(result[:150] if isinstance(result, str) else name)
-                elif isinstance(result, str) and result.startswith('error:'):
-                    pending_errors.append(result[6:].strip())
-
-            # Append all tool results as one user turn
-            if tool_result_parts:
-                conv.append(types.Content(role='user', parts=tool_result_parts))
-                self._trim_conversation(guild_id)
-
-            # Handle wakeup scheduling
+            # Handle wakeup flags
             if tc._wakeup_cancel:
                 tc._wakeup_cancel = False
                 self._cancel_wakeup(guild_id)
@@ -410,12 +443,29 @@ class Agent(commands.Cog):
                 tc._wakeup_scheduled = False
                 self._schedule_wakeup(guild_id, tc._wakeup_seconds)
 
-            if is_done:
-                if pending_errors and not message_sent:
-                    await channel.send(f'⚠️ {" | ".join(pending_errors)}')
-                break
+            # Track actions
+            if tool_name == 'send_message':
+                message_sent = True
+                pending_errors.clear()
+                action_log.append(f'said: {tool_args.get("content", "")[:200]}')
+            elif tool_name == 'add_reaction':
+                action_log.append(f'reacted: {tool_args.get("emoji", "")}')
+            elif tool_name not in _READ_ONLY_TOOLS:
+                if isinstance(result, str) and result.startswith('error:'):
+                    pending_errors.append(result[6:].strip())
+                    action_log.append(f'error({tool_name}): {result[6:].strip()[:100]}')
+                else:
+                    action_log.append(result[:150] if isinstance(result, str) else tool_name)
+            elif isinstance(result, str) and result.startswith('error:'):
+                pending_errors.append(result[6:].strip())
         else:
-            print(f'[agent] Hit max tool rounds ({MAX_TOOL_ROUNDS}) for guild {guild_id}')
+            print(f'[agent] Hit max iterations ({MAX_ITERATIONS}) for guild {guild_id}')
+
+        # Store the full turn as one model Content
+        if assistant_text:
+            conv.append(types.Content(role='model', parts=[types.Part(text=assistant_text)]))
+            self._trim_conversation(guild_id)
+            print(f'[agent] assistant turn: {assistant_text[:300]!r}')
 
         if action_log:
             from utils.database import save_conversation_turn

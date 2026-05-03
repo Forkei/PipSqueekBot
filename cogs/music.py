@@ -79,6 +79,7 @@ class Music(commands.Cog):
 
     async def _advance(self, guild_id: int):
         p = get_player(guild_id)
+        do_autoplay = False
         async with p._lock:
             if p.loop_mode == 'one' and p.current:
                 track = p.current
