@@ -21,9 +21,11 @@ class NowPlayingView(discord.ui.View):
         p = get_player(self.guild_id)
         if p.voice_client and p.voice_client.is_playing():
             p.voice_client.pause()
+            button.emoji = '▶️'
         elif p.voice_client and p.voice_client.is_paused():
             p.voice_client.resume()
-        await interaction.response.defer()
+            button.emoji = '⏸️'
+        await interaction.response.edit_message(view=self)
 
     @discord.ui.button(emoji='⏭️', style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -174,7 +176,7 @@ class Music(commands.Cog):
                 if p.now_playing_msg and p.now_playing_msg.id == p.text_channel.last_message_id:
                     try:
                         await p.now_playing_msg.clear_reactions()
-                        await p.now_playing_msg.edit(embed=embed)
+                        await p.now_playing_msg.edit(embed=embed, view=NowPlayingView(guild_id, self.bot))
                         edited = True
                     except Exception:
                         p.now_playing_msg = None
