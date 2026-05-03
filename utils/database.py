@@ -87,6 +87,7 @@ async def init_db():
                 guild_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
                 display_name TEXT NOT NULL,
+                username TEXT,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (guild_id, user_id)
             )
@@ -107,6 +108,10 @@ async def init_db():
         # Migrations
         try:
             await db.execute('ALTER TABLE conversation_context ADD COLUMN author_id INTEGER')
+        except Exception:
+            pass
+        try:
+            await db.execute('ALTER TABLE users ADD COLUMN username TEXT')
         except Exception:
             pass
         await db.commit()
@@ -298,22 +303,24 @@ async def delete_memory(guild_id: int, key: str):
 CONTEXT_LIMIT = 30
 
 
-async def upsert_user(guild_id: int, user_id: int, display_name: str):
+async def upsert_user(guild_id: int, user_id: int, display_name: str, username: str = None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            'INSERT INTO users (guild_id, user_id, display_name, updated_at) VALUES (?, ?, ?, ?) '
-            'ON CONFLICT(guild_id, user_id) DO UPDATE SET display_name=excluded.display_name, updated_at=excluded.updated_at',
-            (guild_id, user_id, display_name, int(time.time()))
+            'INSERT INTO users (guild_id, user_id, display_name, username, updated_at) VALUES (?, ?, ?, ?, ?) '
+            'ON CONFLICT(guild_id, user_id) DO UPDATE SET '
+            'display_name=excluded.display_name, username=excluded.username, updated_at=excluded.updated_at',
+            (guild_id, user_id, display_name, username, int(time.time()))
         )
         await db.commit()
 
 
-async def get_user_id_by_name(guild_id: int, display_name: str) -> int | None:
-    """Look up user_id for a display name (case-insensitive). Returns None if unknown."""
+async def get_user_id_by_name(guild_id: int, name: str) -> int | None:
+    """Look up user_id by display name or stable username (case-insensitive)."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            'SELECT user_id FROM users WHERE guild_id = ? AND lower(display_name) = lower(?)',
-            (guild_id, display_name)
+            'SELECT user_id FROM users WHERE guild_id = ? '
+            'AND (lower(display_name) = lower(?) OR lower(username) = lower(?))',
+            (guild_id, name, name)
         ) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else None

@@ -313,7 +313,7 @@ class Agent(commands.Cog):
         conv = self._get_conversation(guild_id)
 
         if message and author:
-            await upsert_user(guild_id, author.id, author.display_name)
+            await upsert_user(guild_id, author.id, author.display_name, author.name)
             trigger = {
                 'type': 'user_message',
                 'username': author.display_name,

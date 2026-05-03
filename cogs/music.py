@@ -144,12 +144,14 @@ class Music(commands.Cog):
             if p.text_channel:
                 embed = embeds.now_playing(track, track.get('requester'))
                 # Edit in place if our message is still the most recent, otherwise resend silently
+                edited = False
                 if p.now_playing_msg and p.now_playing_msg.id == p.text_channel.last_message_id:
                     try:
                         await p.now_playing_msg.edit(embed=embed)
+                        edited = True
                     except Exception:
                         p.now_playing_msg = None
-                if not p.now_playing_msg or p.now_playing_msg.id != p.text_channel.last_message_id:
+                if not edited:
                     if p.now_playing_msg:
                         try:
                             await p.now_playing_msg.delete()
@@ -159,6 +161,11 @@ class Music(commands.Cog):
                         p.now_playing_msg = await p.text_channel.send(embed=embed, silent=True)
                     except TypeError:
                         p.now_playing_msg = await p.text_channel.send(embed=embed)
+                    try:
+                        await p.now_playing_msg.add_reaction('❤️')
+                        await p.now_playing_msg.add_reaction('⏭️')
+                    except Exception:
+                        pass
 
             requester = track.get('requester')
             from utils.database import log_play
@@ -493,26 +500,32 @@ class Music(commands.Cog):
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         if payload.user_id == self.bot.user.id or not payload.guild_id:
             return
-        if str(payload.emoji) != '❤️':
-            return
         p = get_player(payload.guild_id)
         if not p.now_playing_msg or p.now_playing_msg.id != payload.message_id:
             return
-        track = p.current
-        if not track:
-            return
-        guild = self.bot.get_guild(payload.guild_id)
-        member = guild.get_member(payload.user_id) if guild else None
-        user_name = member.display_name if member else str(payload.user_id)
-        from utils.database import like_song
-        await like_song(
-            payload.guild_id, payload.user_id, user_name,
-            track.get('id', ''), track['title'], track['url']
-        )
-        try:
-            await p.now_playing_msg.add_reaction('💜')
-        except Exception:
-            pass
+
+        emoji = str(payload.emoji)
+
+        if emoji == '❤️':
+            track = p.current
+            if not track:
+                return
+            guild = self.bot.get_guild(payload.guild_id)
+            member = guild.get_member(payload.user_id) if guild else None
+            user_name = member.display_name if member else str(payload.user_id)
+            from utils.database import like_song
+            await like_song(
+                payload.guild_id, payload.user_id, user_name,
+                track.get('id', ''), track['title'], track['url']
+            )
+            try:
+                await p.now_playing_msg.add_reaction('💜')
+            except Exception:
+                pass
+
+        elif emoji == '⏭️':
+            if p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()):
+                p.voice_client.stop()
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
