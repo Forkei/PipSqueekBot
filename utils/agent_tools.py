@@ -77,9 +77,13 @@ async def play_song(tc: ToolContext, query: str) -> str:
     user_initiated = tc.author is not None and tc.trigger_message is not None
     if not user_initiated:
         from utils.database import get_play_history
-        recent = await get_play_history(tc.guild.id, limit=20)
+        recent = await get_play_history(tc.guild.id, limit=30)
         recent_titles = {r['title'].lower() for r in recent}
-        if info['title'].lower() in recent_titles:
+        # Also check what's currently queued / playing so we don't double-queue
+        queued_titles = {t['title'].lower() for t in p.queue}
+        if p.current:
+            queued_titles.add(p.current['title'].lower())
+        if info['title'].lower() in recent_titles or info['title'].lower() in queued_titles:
             return f'skipped: "{info["title"]}" was recently played'
 
     track = {**info, 'requester': tc.author or tc.guild.me}

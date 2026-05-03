@@ -144,12 +144,17 @@ class Music(commands.Cog):
                 await p.text_channel.send(embed=embeds.now_playing(track, track.get('requester')))
 
             requester = track.get('requester')
+            from utils.database import log_play
             if requester and isinstance(requester, discord.Member) and not requester.bot:
-                from utils.database import log_play
-                asyncio.create_task(log_play(
-                    guild_id, requester.id, str(requester.display_name),
-                    track.get('id', ''), track['title'], track['url']
-                ))
+                uid, uname = requester.id, str(requester.display_name)
+            else:
+                guild_obj = self.bot.get_guild(guild_id)
+                uid = guild_obj.me.id if guild_obj else 0
+                uname = 'PipSqueek'
+            asyncio.create_task(log_play(
+                guild_id, uid, uname,
+                track.get('id', ''), track['title'], track['url']
+            ))
 
             if p.dj_mode:
                 asyncio.create_task(self._send_dj_comment(p, track['title'], previous_title))
