@@ -117,6 +117,9 @@ class Music(commands.Cog):
                 do_autoplay = p.autoplay and p.current
                 if not do_autoplay:
                     p.current = None
+                    agent_cog = self.bot.cogs.get('Agent')
+                    if agent_cog and agent_cog.get_mode(guild_id) == 'mk2':
+                        agent_cog.schedule_auto_wakeup(guild_id, 2)
                     return
 
         if do_autoplay:
@@ -170,6 +173,7 @@ class Music(commands.Cog):
                 edited = False
                 if p.now_playing_msg and p.now_playing_msg.id == p.text_channel.last_message_id:
                     try:
+                        await p.now_playing_msg.clear_reactions()
                         await p.now_playing_msg.edit(embed=embed)
                         edited = True
                     except Exception:
