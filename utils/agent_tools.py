@@ -101,9 +101,9 @@ async def play_song(tc: ToolContext, query: str) -> str:
 
     if play_immediately:
         await music_cog._play_track(tc.guild.id, p, track)
-        return f'playing: "{info["title"]}"'
+        return f'playing: "[{info["title"]}]({info["url"]})"'
     else:
-        return f'queued: "{info["title"]}" at position #{queue_pos}'
+        return f'queued: "[{info["title"]}]({info["url"]})" at position #{queue_pos}'
 
 
 async def skip_song(tc: ToolContext) -> str:
@@ -422,7 +422,7 @@ async def list_memories(tc: ToolContext) -> str:
 
 
 async def schedule_wakeup(tc: ToolContext, seconds: int) -> str:
-    seconds = max(60, min(3600, seconds))
+    seconds = max(5, min(3600, seconds))
     tc._wakeup_scheduled = True
     tc._wakeup_seconds = seconds
     return f'wakeup scheduled in {seconds}s'
@@ -461,6 +461,84 @@ async def poll(tc: ToolContext, question: str, options: str) -> str:
     for emoji in emojis[:len(option_list)]:
         await msg.add_reaction(emoji)
     return f'poll posted with {len(option_list)} options'
+
+
+async def get_liked_songs(tc: ToolContext, user_name: str = None) -> str:
+    from utils.database import get_liked_songs as db_liked, get_user_id_by_name
+    if user_name:
+        user_id = await get_user_id_by_name(tc.guild.id, user_name)
+        rows = await db_liked(tc.guild.id, user_id=user_id, limit=30)
+        if not rows:
+            return f'no liked songs for {user_name}'
+        return f"{user_name}'s liked songs:\n" + '\n'.join(f'[{r["title"]}]({r["url"]})' for r in rows)
+    rows = await db_liked(tc.guild.id, limit=60)
+    if not rows:
+        return 'no liked songs yet'
+    return '\n'.join(f'{r["user_name"]}: [{r["title"]}]({r["url"]})' for r in rows)
+
+
+async def get_recommendations(tc: ToolContext) -> str:
+    import datetime
+    import json
+    import re
+    import os
+    from cogs.music import get_player
+    from utils.database import get_liked_songs as db_liked, get_play_history, get_user_play_history
+    from google import genai
+    from google.genai import types
+
+    p = get_player(tc.guild.id)
+    vc_members = [m for m in p.voice_client.channel.members if not m.bot] if p.voice_client else []
+
+    user_lines = []
+    for member in vc_members:
+        liked = await db_liked(tc.guild.id, user_id=member.id, limit=20)
+        history = await get_user_play_history(tc.guild.id, member.id, limit=10)
+        liked_titles = [r['title'] for r in liked]
+        requested = [r['title'] for r in history if r['user_name'] != 'PipSqueek']
+        line = f'- {member.display_name}'
+        if liked_titles:
+            line += f': liked [{", ".join(liked_titles[:10])}]'
+        if requested:
+            line += f', requested [{", ".join(requested[:5])}]'
+        if not liked_titles and not requested:
+            line += ': no history'
+        user_lines.append(line)
+
+    recent = await get_play_history(tc.guild.id, limit=15)
+    recent_titles = [r['title'] for r in recent]
+    current_title = p.current['title'] if p.current else None
+    hour = datetime.datetime.now().hour
+    time_ctx = ('late night' if hour >= 22 or hour < 4 else
+                'evening' if hour >= 18 else
+                'afternoon' if hour >= 12 else 'morning')
+
+    prompt = (
+        f'You are a music recommendation engine for a Discord server. Time: {time_ctx}.\n'
+        f'Currently playing: {current_title or "nothing"}.\n'
+        f'Recently played (avoid repeating): {", ".join(recent_titles) or "none"}.\n'
+        f'Listeners:\n' + ('\n'.join(user_lines) if user_lines else '- no one in voice') + '\n\n'
+        f'Suggest 8 songs that fit this room right now. Consider the time of day and each '
+        f'listener\'s taste. Vary the energy slightly. '
+        f'Return ONLY a JSON array: [{{"artist":"...", "title":"..."}}]'
+    )
+
+    try:
+        client = genai.Client(api_key=os.getenv('GEMINI_API_KEY', ''))
+        response = await client.aio.models.generate_content(
+            model='gemini-3.1-flash-lite-preview',
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.85, max_output_tokens=400),
+        )
+        text = (response.text or '').strip()
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            return f'error: could not parse recommendations'
+        songs = json.loads(match.group())
+        suggestions = [f'{s["artist"]} - {s["title"]}' for s in songs if 'artist' in s and 'title' in s]
+        return 'Recommended: ' + ' | '.join(suggestions[:8])
+    except Exception as e:
+        return f'error: {type(e).__name__}: {e}'
 
 
 async def web_search(tc: ToolContext, query: str) -> str:
@@ -525,6 +603,8 @@ TOOL_HANDLERS = {
     'send_message': send_message,
     'add_reaction': add_reaction,
     'poll': poll,
+    'get_liked_songs': get_liked_songs,
+    'get_recommendations': get_recommendations,
     'web_search': web_search,
     'sleep': sleep,
     'done': done,

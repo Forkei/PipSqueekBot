@@ -91,7 +91,20 @@ async def init_db():
                 PRIMARY KEY (guild_id, user_id)
             )
         ''')
-        # Migration: add author_id to conversation_context if not present
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS liked_songs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_name TEXT NOT NULL,
+                video_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                url TEXT NOT NULL,
+                liked_at INTEGER NOT NULL,
+                UNIQUE(guild_id, user_id, video_id)
+            )
+        ''')
+        # Migrations
         try:
             await db.execute('ALTER TABLE conversation_context ADD COLUMN author_id INTEGER')
         except Exception:
@@ -374,6 +387,54 @@ async def load_all_guild_configs() -> list:
         db.row_factory = aiosqlite.Row
         async with db.execute('SELECT guild_id, mode, agent_channel_id FROM guild_config') as cursor:
             return await cursor.fetchall()
+
+
+# ─── Liked Songs ───────────────────────────────────────────────────────────────
+
+async def like_song(guild_id: int, user_id: int, user_name: str,
+                    video_id: str, title: str, url: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'INSERT OR IGNORE INTO liked_songs (guild_id, user_id, user_name, video_id, title, url, liked_at) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?)',
+            (guild_id, user_id, user_name, video_id, title, url, int(time.time()))
+        )
+        await db.commit()
+
+
+async def unlike_song(guild_id: int, user_id: int, video_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'DELETE FROM liked_songs WHERE guild_id = ? AND user_id = ? AND video_id = ?',
+            (guild_id, user_id, video_id)
+        )
+        await db.commit()
+
+
+async def get_liked_songs(guild_id: int, user_id: int | None = None, limit: int = 50) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if user_id is not None:
+            async with db.execute(
+                'SELECT * FROM liked_songs WHERE guild_id = ? AND user_id = ? ORDER BY liked_at DESC LIMIT ?',
+                (guild_id, user_id, limit)
+            ) as cursor:
+                return await cursor.fetchall()
+        else:
+            async with db.execute(
+                'SELECT * FROM liked_songs WHERE guild_id = ? ORDER BY liked_at DESC LIMIT ?',
+                (guild_id, limit)
+            ) as cursor:
+                return await cursor.fetchall()
+
+
+async def is_song_liked(guild_id: int, user_id: int, video_id: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT 1 FROM liked_songs WHERE guild_id = ? AND user_id = ? AND video_id = ?',
+            (guild_id, user_id, video_id)
+        ) as cursor:
+            return await cursor.fetchone() is not None
 
 
 # ─── Taste Profiles ────────────────────────────────────────────────────────────

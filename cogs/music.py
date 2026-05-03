@@ -23,6 +23,7 @@ class GuildPlayer:
         self.dj_mode: bool = False
         self.volume: float = 0.5
         self.play_start_time: float | None = None
+        self.now_playing_msg: discord.Message | None = None
         self._lock = asyncio.Lock()
         self._predownload_tasks: dict[str, asyncio.Task] = {}
 
@@ -141,7 +142,23 @@ class Music(commands.Cog):
                     agent_cog.schedule_auto_wakeup(guild_id, wakeup_secs)
 
             if p.text_channel:
-                await p.text_channel.send(embed=embeds.now_playing(track, track.get('requester')))
+                embed = embeds.now_playing(track, track.get('requester'))
+                # Edit in place if our message is still the most recent, otherwise resend silently
+                if p.now_playing_msg and p.now_playing_msg.id == p.text_channel.last_message_id:
+                    try:
+                        await p.now_playing_msg.edit(embed=embed)
+                    except Exception:
+                        p.now_playing_msg = None
+                if not p.now_playing_msg or p.now_playing_msg.id != p.text_channel.last_message_id:
+                    if p.now_playing_msg:
+                        try:
+                            await p.now_playing_msg.delete()
+                        except Exception:
+                            pass
+                    try:
+                        p.now_playing_msg = await p.text_channel.send(embed=embed, silent=True)
+                    except TypeError:
+                        p.now_playing_msg = await p.text_channel.send(embed=embed)
 
             requester = track.get('requester')
             from utils.database import log_play
@@ -469,6 +486,48 @@ class Music(commands.Cog):
             return
 
         await ctx.invoke(self.play, query=results[pick]['url'])
+
+    # ─── Liked songs via reaction ──────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        if payload.user_id == self.bot.user.id or not payload.guild_id:
+            return
+        if str(payload.emoji) != '❤️':
+            return
+        p = get_player(payload.guild_id)
+        if not p.now_playing_msg or p.now_playing_msg.id != payload.message_id:
+            return
+        track = p.current
+        if not track:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        member = guild.get_member(payload.user_id) if guild else None
+        user_name = member.display_name if member else str(payload.user_id)
+        from utils.database import like_song
+        await like_song(
+            payload.guild_id, payload.user_id, user_name,
+            track.get('id', ''), track['title'], track['url']
+        )
+        try:
+            await p.now_playing_msg.add_reaction('💜')
+        except Exception:
+            pass
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
+        if payload.user_id == self.bot.user.id or not payload.guild_id:
+            return
+        if str(payload.emoji) != '❤️':
+            return
+        p = get_player(payload.guild_id)
+        if not p.now_playing_msg or p.now_playing_msg.id != payload.message_id:
+            return
+        track = p.current
+        if not track:
+            return
+        from utils.database import unlike_song
+        await unlike_song(payload.guild_id, payload.user_id, track.get('id', ''))
 
 
 async def setup(bot: commands.Bot):

@@ -17,7 +17,7 @@ def _voice_summary(guild: discord.Guild) -> str:
 
 async def build_context(guild: discord.Guild, author: discord.Member | None = None) -> str:
     from cogs.music import get_player
-    from utils.database import get_play_history, list_memories, get_taste_profile
+    from utils.database import get_play_history, list_memories, get_taste_profile, get_liked_songs
 
     p = get_player(guild.id)
     parts = []
@@ -26,6 +26,26 @@ async def build_context(guild: discord.Guild, author: discord.Member | None = No
 
     parts.append('\nVoice channels with people:')
     parts.append(_voice_summary(guild))
+
+    # Per-user taste data for everyone currently in voice
+    if p.voice_client:
+        vc_members = [m for m in p.voice_client.channel.members if not m.bot]
+        if vc_members:
+            parts.append('\nListeners taste:')
+            for member in vc_members:
+                liked = await get_liked_songs(guild.id, user_id=member.id, limit=20)
+                profile = await get_taste_profile(guild.id, member.id)
+                liked_titles = [r['title'] for r in liked]
+                line = f'  {member.display_name}'
+                if liked_titles:
+                    line += f' — ❤️ {", ".join(liked_titles[:10])}'
+                    if len(liked_titles) > 10:
+                        line += f' (+{len(liked_titles)-10} more)'
+                if profile:
+                    line += f' | {profile}'
+                if not liked_titles and not profile:
+                    line += ' — no history yet'
+                parts.append(line)
 
     if p.current:
         req = p.current.get('requester')

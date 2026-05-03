@@ -42,6 +42,7 @@ _SINGLE_PARAM = {
     'sleep': 'seconds',
     'remove_from_queue': 'position',
     'set_loop_mode': 'mode',
+    'get_liked_songs': 'user_name',
     'web_search': 'query',
     'poll': 'question',
 }
@@ -52,6 +53,7 @@ _READ_ONLY_TOOLS = {
     'done', 'get_queue', 'get_now_playing', 'search_songs',
     'get_recent_history', 'get_user_history', 'list_playlists',
     'retrieve_memory', 'list_memories', 'web_search', 'sleep',
+    'get_liked_songs', 'get_recommendations',
 }
 
 _client: genai.Client | None = None
