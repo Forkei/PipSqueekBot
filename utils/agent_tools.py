@@ -464,22 +464,27 @@ async def poll(tc: ToolContext, question: str, options: str) -> str:
 
 
 async def web_search(tc: ToolContext, query: str) -> str:
-    import aiohttp
-    url = 'https://api.duckduckgo.com/'
-    params = {'q': query, 'format': 'json', 'no_html': '1', 'skip_disambig': '1'}
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                data = await resp.json(content_type=None)
-        lines = []
-        if data.get('AbstractText'):
-            lines.append(data['AbstractText'])
-        for r in data.get('RelatedTopics', [])[:5]:
-            if isinstance(r, dict) and r.get('Text'):
-                lines.append(r['Text'])
-        return '\n'.join(lines) if lines else 'no results found'
+        from ddgs import DDGS
+        results = await asyncio.to_thread(
+            lambda: list(DDGS().text(query, max_results=4))
+        )
+        if not results:
+            return 'no results found'
+        lines = [
+            f'{r["title"]}: {r["body"]}'
+            for r in results
+            if r.get('body')
+        ]
+        return '\n'.join(lines[:3]) if lines else 'no results found'
     except Exception as e:
         return f'error: {type(e).__name__}: {e}'
+
+
+async def sleep(tc: ToolContext, seconds: int) -> str:
+    seconds = max(1, min(30, seconds))
+    await asyncio.sleep(seconds)
+    return f'waited {seconds}s'
 
 
 async def done(tc: ToolContext) -> str:
@@ -521,6 +526,7 @@ TOOL_HANDLERS = {
     'add_reaction': add_reaction,
     'poll': poll,
     'web_search': web_search,
+    'sleep': sleep,
     'done': done,
 }
 

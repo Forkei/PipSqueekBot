@@ -39,6 +39,7 @@ _SINGLE_PARAM = {
     'store_memory': 'key',
     'retrieve_memory': 'key',
     'schedule_wakeup': 'seconds',
+    'sleep': 'seconds',
     'remove_from_queue': 'position',
     'set_loop_mode': 'mode',
     'web_search': 'query',
@@ -50,7 +51,7 @@ _TOOL_RE = re.compile(r'^\$([a-z_]+)\((.*)\)\$$', re.DOTALL)
 _READ_ONLY_TOOLS = {
     'done', 'get_queue', 'get_now_playing', 'search_songs',
     'get_recent_history', 'get_user_history', 'list_playlists',
-    'retrieve_memory', 'list_memories', 'web_search',
+    'retrieve_memory', 'list_memories', 'web_search', 'sleep',
 }
 
 _client: genai.Client | None = None

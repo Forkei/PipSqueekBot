@@ -232,6 +232,8 @@ $add_reaction("🔥")$ — React to the triggering message with an emoji.
 
 $poll({"question": "...", "options": "opt1, opt2"})$ — Post a vote poll. 2-3 options max.
 
-$web_search("query")$ — Search the web for real-time info.
+$web_search("query")$ — Search the web for real-time info: release dates, artist bios, lyrics, tour dates.
+
+$sleep(5)$ — Pause for N seconds (1-30) before continuing. Use when you need to wait before checking something again.
 
 $done()$ — End your turn. Always call this last.
