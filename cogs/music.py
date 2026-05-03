@@ -9,6 +9,29 @@ from utils.ytdl import format_duration
 
 LOOKAHEAD_DEPTH = 3
 
+
+class NowPlayingView(discord.ui.View):
+    def __init__(self, guild_id: int, bot: commands.Bot):
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.bot = bot
+
+    @discord.ui.button(emoji='⏸️', style=discord.ButtonStyle.secondary)
+    async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = get_player(self.guild_id)
+        if p.voice_client and p.voice_client.is_playing():
+            p.voice_client.pause()
+        elif p.voice_client and p.voice_client.is_paused():
+            p.voice_client.resume()
+        await interaction.response.defer()
+
+    @discord.ui.button(emoji='⏭️', style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        p = get_player(self.guild_id)
+        if p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()):
+            p.voice_client.stop()
+        await interaction.response.defer()
+
 YES_WORDS = {'yes', 'yup', 'yeah', 'y', 'yep', 'sure', 'ok', 'okay', '1', 'first', 'this', 'that', 'it'}
 
 
@@ -157,16 +180,11 @@ class Music(commands.Cog):
                             await p.now_playing_msg.delete()
                         except Exception:
                             pass
+                    view = NowPlayingView(guild_id, self.bot)
                     try:
-                        p.now_playing_msg = await p.text_channel.send(embed=embed, silent=True)
+                        p.now_playing_msg = await p.text_channel.send(embed=embed, view=view, silent=True)
                     except TypeError:
-                        p.now_playing_msg = await p.text_channel.send(embed=embed)
-                    try:
-                        await p.now_playing_msg.add_reaction('❤️')
-                        await p.now_playing_msg.add_reaction('⏸️')
-                        await p.now_playing_msg.add_reaction('⏭️')
-                    except Exception:
-                        pass
+                        p.now_playing_msg = await p.text_channel.send(embed=embed, view=view)
 
             requester = track.get('requester')
             from utils.database import log_play
@@ -505,30 +523,19 @@ class Music(commands.Cog):
         if not p.now_playing_msg or p.now_playing_msg.id != payload.message_id:
             return
 
-        emoji = str(payload.emoji)
-
-        if emoji == '❤️':
-            track = p.current
-            if not track:
-                return
-            guild = self.bot.get_guild(payload.guild_id)
-            member = guild.get_member(payload.user_id) if guild else None
-            user_name = member.display_name if member else str(payload.user_id)
-            from utils.database import like_song
-            await like_song(
-                payload.guild_id, payload.user_id, user_name,
-                track.get('id', ''), track['title'], track['url']
-            )
-
-        elif emoji == '⏭️':
-            if p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()):
-                p.voice_client.stop()
-
-        elif emoji == '⏸️':
-            if p.voice_client and p.voice_client.is_playing():
-                p.voice_client.pause()
-            elif p.voice_client and p.voice_client.is_paused():
-                p.voice_client.resume()
+        if str(payload.emoji) != '❤️':
+            return
+        track = p.current
+        if not track:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        member = guild.get_member(payload.user_id) if guild else None
+        user_name = member.display_name if member else str(payload.user_id)
+        from utils.database import like_song
+        await like_song(
+            payload.guild_id, payload.user_id, user_name,
+            track.get('id', ''), track['title'], track['url']
+        )
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):

@@ -10,15 +10,24 @@ GOLD = 0xFFD700
 
 
 def now_playing(track: dict, requester: discord.Member = None) -> discord.Embed:
-    e = discord.Embed(title='🎵 Now Playing', description=f"**{track['title']}**", color=PINK)
+    e = discord.Embed(title=track['title'], url=track.get('url'), color=PINK)
+    e.set_author(name='Now Playing')
     if track.get('thumbnail'):
         e.set_thumbnail(url=track['thumbnail'])
+    parts = []
     if track.get('duration'):
-        e.add_field(name='Duration', value=format_duration(track['duration']), inline=True)
+        parts.append(format_duration(track['duration']))
     if track.get('uploader'):
-        e.add_field(name='Channel', value=track['uploader'], inline=True)
-    if requester:
-        e.set_footer(text=f'Requested by {requester.display_name}', icon_url=requester.display_avatar.url)
+        parts.append(track['uploader'])
+    footer_text = ' · '.join(parts)
+    if requester and hasattr(requester, 'display_name') and not getattr(requester, 'bot', False):
+        footer_text += f' · {requester.display_name}'
+        try:
+            e.set_footer(text=footer_text, icon_url=requester.display_avatar.url)
+        except Exception:
+            e.set_footer(text=footer_text)
+    elif footer_text:
+        e.set_footer(text=footer_text)
     return e
 
 
