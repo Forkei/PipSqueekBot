@@ -220,7 +220,8 @@ class Music(commands.Cog):
             requester = track.get('requester')
             from utils.database import log_play
             if requester and isinstance(requester, discord.Member) and not requester.bot:
-                uid, uname = requester.id, str(requester.display_name)
+                uid = requester.id
+                uname = requester.display_name if requester.display_name == requester.name else f'{requester.display_name} (@{requester.name})'
             else:
                 guild_obj = self.bot.get_guild(guild_id)
                 uid = guild_obj.me.id if guild_obj else 0

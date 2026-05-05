@@ -255,7 +255,10 @@ async def get_now_playing(tc: ToolContext) -> str:
         return 'nothing playing'
     t = p.current
     req = t.get('requester')
-    req_name = req.display_name if req and hasattr(req, 'display_name') else 'unknown'
+    if req and hasattr(req, 'display_name'):
+        req_name = req.display_name if req.display_name == req.name else f'{req.display_name} (@{req.name})'
+    else:
+        req_name = 'unknown'
     return (
         f'title: {t["title"]}\n'
         f'duration: {format_duration(t.get("duration", 0))}\n'
@@ -421,6 +424,12 @@ async def list_memories(tc: ToolContext) -> str:
     return '\n'.join(f'{k}: {v}' for k, v in memories)
 
 
+async def delete_memory(tc: ToolContext, key: str) -> str:
+    from utils.database import delete_memory as db_delete
+    await db_delete(tc.guild.id, key)
+    return f'deleted memory: {key}'
+
+
 async def schedule_wakeup(tc: ToolContext, seconds: int) -> str:
     seconds = max(5, min(3600, seconds))
     tc._wakeup_scheduled = True
@@ -565,6 +574,12 @@ async def sleep(tc: ToolContext, seconds: int) -> str:
     return f'waited {seconds}s'
 
 
+async def leave_note(tc: ToolContext, content: str) -> str:
+    from utils.database import add_dev_note
+    await add_dev_note(tc.guild.id, content)
+    return 'note saved'
+
+
 async def done(tc: ToolContext) -> str:
     return 'done'
 
@@ -598,6 +613,7 @@ TOOL_HANDLERS = {
     'store_memory': store_memory,
     'retrieve_memory': retrieve_memory,
     'list_memories': list_memories,
+    'delete_memory': delete_memory,
     'schedule_wakeup': schedule_wakeup,
     'cancel_wakeup': cancel_wakeup,
     'send_message': send_message,
@@ -607,6 +623,7 @@ TOOL_HANDLERS = {
     'get_recommendations': get_recommendations,
     'web_search': web_search,
     'sleep': sleep,
+    'leave_note': leave_note,
     'done': done,
 }
 

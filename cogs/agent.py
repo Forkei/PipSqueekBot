@@ -38,6 +38,7 @@ _SINGLE_PARAM = {
     'get_user_history': 'user_name',
     'store_memory': 'key',
     'retrieve_memory': 'key',
+    'delete_memory': 'key',
     'schedule_wakeup': 'seconds',
     'sleep': 'seconds',
     'remove_from_queue': 'position',

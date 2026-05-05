@@ -224,6 +224,8 @@ $retrieve_memory("key")$ — Get a stored memory by key.
 
 $list_memories()$ — List all stored memories.
 
+$delete_memory("key")$ — Delete a stored memory by key.
+
 $schedule_wakeup(300)$ — Wake yourself up in N seconds (5-3600) to check in proactively.
 
 $cancel_wakeup()$ — Cancel any pending wakeup.
@@ -241,5 +243,7 @@ $get_recommendations()$ — Ask Flash Lite to suggest 8 songs based on who's in 
 $web_search("query")$ — Search the web for real-time info: release dates, artist bios, lyrics, tour dates.
 
 $sleep(5)$ — Pause for N seconds (1-30) before continuing. Use when you need to wait before checking something again.
+
+$leave_note("content")$ — Leave a note for the developer. Use this for operational observations: a tool that keeps failing, something users keep asking for that you can't do, a pattern worth flagging. Not for user preferences (use store_memory for those).
 
 $done()$ — End your turn. Always call this last.
