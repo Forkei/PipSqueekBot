@@ -6,10 +6,16 @@ import discord
 from utils.ytdl import format_duration
 
 
+def _member_label(m: discord.Member) -> str:
+    if m.display_name != m.name:
+        return f'{m.display_name} (@{m.name})'
+    return m.display_name
+
+
 def _voice_summary(guild: discord.Guild) -> str:
     lines = []
     for vc in guild.voice_channels:
-        members = [m.display_name for m in vc.members if not m.bot]
+        members = [_member_label(m) for m in vc.members if not m.bot]
         if members:
             lines.append(f'  #{vc.name}: {", ".join(members)}')
     return '\n'.join(lines) if lines else '  (empty)'
@@ -36,7 +42,7 @@ async def build_context(guild: discord.Guild, author: discord.Member | None = No
                 liked = await get_liked_songs(guild.id, user_id=member.id, limit=20)
                 profile = await get_taste_profile(guild.id, member.id)
                 liked_titles = [r['title'] for r in liked]
-                line = f'  {member.display_name}'
+                line = f'  {_member_label(member)}'
                 if liked_titles:
                     line += f' — ❤️ {", ".join(liked_titles[:10])}'
                     if len(liked_titles) > 10:
@@ -49,7 +55,7 @@ async def build_context(guild: discord.Guild, author: discord.Member | None = No
 
     if p.current:
         req = p.current.get('requester')
-        req_name = req.display_name if req and hasattr(req, 'display_name') else '?'
+        req_name = _member_label(req) if req and hasattr(req, 'display_name') else '?'
         parts.append(
             f'\nNow playing: "{p.current["title"]}" '
             f'({format_duration(p.current.get("duration", 0))}) '
@@ -65,13 +71,13 @@ async def build_context(guild: discord.Guild, author: discord.Member | None = No
         queue_lines = []
         for i, t in enumerate(next_tracks):
             req = t.get('requester')
-            req_name = req.display_name if req and hasattr(req, 'display_name') else '?'
+            req_name = _member_label(req) if req and hasattr(req, 'display_name') else '?'
             queue_lines.append(f'  {i+1}. {t["title"]} (req: {req_name})')
         if len(p.queue) > 5:
             queue_lines.append(f'  ... and {len(p.queue) - 5} more')
         from collections import Counter
         user_counts = Counter(
-            t['requester'].display_name
+            _member_label(t['requester'])
             for t in p.queue
             if t.get('requester') and hasattr(t['requester'], 'display_name')
         )
@@ -94,6 +100,6 @@ async def build_context(guild: discord.Guild, author: discord.Member | None = No
     if author and not author.bot:
         profile = await get_taste_profile(guild.id, author.id)
         if profile:
-            parts.append(f'\nTaste profile for {author.display_name}: {profile}')
+            parts.append(f'\nTaste profile for {_member_label(author)}: {profile}')
 
     return '\n'.join(parts)

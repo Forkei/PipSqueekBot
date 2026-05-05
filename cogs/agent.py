@@ -45,6 +45,7 @@ _SINGLE_PARAM = {
     'get_liked_songs': 'user_name',
     'web_search': 'query',
     'poll': 'question',
+    'leave_note': 'content',
 }
 
 _TOOL_RE = re.compile(r'^\$([a-z_]+)\((.*)\)\$$', re.DOTALL)
@@ -166,6 +167,28 @@ class Agent(commands.Cog):
             await ctx.send(embed=embeds.error('Use `pip mode mk1` or `pip mode mk2`.'))
 
     # ─── Agent channel config ──────────────────────────────────────────────────
+
+    @commands.command(name='notes')
+    async def notes_cmd(self, ctx: commands.Context, *, args: str = ''):
+        """Read or clear PipSqueek's developer notes. Usage: pip notes [clear]"""
+        from utils.database import get_dev_notes, clear_dev_notes
+        import datetime
+        guild_id = ctx.guild.id
+        if args.strip().lower() == 'clear':
+            await clear_dev_notes(guild_id)
+            await ctx.send(embed=embeds.success('Dev notes cleared.'))
+            return
+        notes = await get_dev_notes(guild_id, limit=20)
+        if not notes:
+            await ctx.send(embed=embeds.info('No dev notes yet.'))
+            return
+        lines = []
+        for n in reversed(notes):
+            ts = datetime.datetime.fromtimestamp(n['created_at']).strftime('%m/%d %H:%M')
+            lines.append(f'`{ts}` {n["content"]}')
+        e = discord.Embed(title='📝 Dev Notes', description='\n'.join(lines), color=embeds.GOLD)
+        e.set_footer(text=f'{len(notes)} note(s) · pip notes clear to wipe')
+        await ctx.send(embed=e)
 
     @commands.command(name='setchannel')
     async def setchannel(self, ctx: commands.Context):
@@ -314,9 +337,12 @@ class Agent(commands.Cog):
 
         if message and author:
             await upsert_user(guild_id, author.id, author.display_name, author.name)
+            display = author.display_name
+            if author.name != display:
+                display = f'{display} (@{author.name})'
             trigger = {
                 'type': 'user_message',
-                'username': author.display_name,
+                'username': display,
                 'text': message.content,
                 'uuid': str(message.id),
             }

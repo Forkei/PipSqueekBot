@@ -8,16 +8,29 @@ from utils import ytdl, embeds
 from utils.ytdl import format_duration
 
 LOOKAHEAD_DEPTH = 3
+OWNER_USERNAME = 'forkei'
 
 
 class NowPlayingView(discord.ui.View):
-    def __init__(self, guild_id: int, bot: commands.Bot):
+    def __init__(self, guild_id: int, bot: commands.Bot, requester_id: int | None = None):
         super().__init__(timeout=None)
         self.guild_id = guild_id
         self.bot = bot
+        self.requester_id = requester_id
+
+    def _is_allowed(self, interaction: discord.Interaction) -> bool:
+        user = interaction.user
+        return (
+            self.requester_id is None
+            or user.id == self.requester_id
+            or user.name == OWNER_USERNAME
+        )
 
     @discord.ui.button(emoji='⏸️', style=discord.ButtonStyle.secondary)
     async def pause_resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._is_allowed(interaction):
+            await interaction.response.send_message('Only the person who queued this track can pause it.', ephemeral=True)
+            return
         p = get_player(self.guild_id)
         if p.voice_client and p.voice_client.is_playing():
             p.voice_client.pause()
@@ -29,6 +42,9 @@ class NowPlayingView(discord.ui.View):
 
     @discord.ui.button(emoji='⏭️', style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._is_allowed(interaction):
+            await interaction.response.send_message('Only the person who queued this track can skip it.', ephemeral=True)
+            return
         p = get_player(self.guild_id)
         if p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()):
             p.voice_client.stop()
@@ -49,6 +65,7 @@ class GuildPlayer:
         self.volume: float = 0.5
         self.play_start_time: float | None = None
         self.now_playing_msg: discord.Message | None = None
+        self.last_human_msg_id: int = 0
         self._lock = asyncio.Lock()
         self._predownload_tasks: dict[str, asyncio.Task] = {}
 
@@ -170,15 +187,23 @@ class Music(commands.Cog):
                     agent_cog.schedule_auto_wakeup(guild_id, wakeup_secs)
 
             if p.text_channel:
-                embed = embeds.now_playing(track, track.get('requester'))
+                requester_obj = track.get('requester')
+                requester_id = requester_obj.id if isinstance(requester_obj, discord.Member) else None
+                embed = embeds.now_playing(track, requester_obj)
                 # Edit in place if our message is still the most recent, otherwise resend silently
                 edited = False
-                if p.now_playing_msg and p.now_playing_msg.id == p.text_channel.last_message_id:
+                old_msg = p.now_playing_msg
+                if old_msg and p.last_human_msg_id <= old_msg.id:
                     try:
-                        await p.now_playing_msg.clear_reactions()
-                        await p.now_playing_msg.edit(embed=embed, view=NowPlayingView(guild_id, self.bot))
+                        await old_msg.clear_reactions()
+                        await old_msg.edit(embed=embed, view=NowPlayingView(guild_id, self.bot, requester_id))
                         edited = True
                     except Exception:
+                        # clear_reactions failed (missing perms) or edit failed — fall through to resend
+                        try:
+                            await old_msg.delete()
+                        except Exception:
+                            pass
                         p.now_playing_msg = None
                 if not edited:
                     if p.now_playing_msg:
@@ -186,7 +211,7 @@ class Music(commands.Cog):
                             await p.now_playing_msg.delete()
                         except Exception:
                             pass
-                    view = NowPlayingView(guild_id, self.bot)
+                    view = NowPlayingView(guild_id, self.bot, requester_id)
                     try:
                         p.now_playing_msg = await p.text_channel.send(embed=embed, view=view, silent=True)
                     except TypeError:
@@ -519,6 +544,16 @@ class Music(commands.Cog):
 
         await ctx.invoke(self.play, query=results[pick]['url'])
 
+    # ─── Track human messages for edit-in-place logic ─────────────────────────
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not message.guild:
+            return
+        p = get_player(message.guild.id)
+        if p.text_channel and message.channel.id == p.text_channel.id:
+            p.last_human_msg_id = message.id
+
     # ─── Liked songs via reaction ──────────────────────────────────────────────
 
     @commands.Cog.listener()
@@ -536,7 +571,10 @@ class Music(commands.Cog):
             return
         guild = self.bot.get_guild(payload.guild_id)
         member = guild.get_member(payload.user_id) if guild else None
-        user_name = member.display_name if member else str(payload.user_id)
+        if member:
+            user_name = member.display_name if member.display_name == member.name else f'{member.display_name} (@{member.name})'
+        else:
+            user_name = str(payload.user_id)
         from utils.database import like_song
         await like_song(
             payload.guild_id, payload.user_id, user_name,

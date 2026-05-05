@@ -21,7 +21,11 @@ def now_playing(track: dict, requester: discord.Member = None) -> discord.Embed:
         parts.append(track['uploader'])
     footer_text = ' · '.join(parts)
     if requester and hasattr(requester, 'display_name') and not getattr(requester, 'bot', False):
-        footer_text += f' · {requester.display_name}'
+        name = requester.display_name
+        raw = getattr(requester, 'name', None)
+        if raw and raw != name:
+            name = f'{name} (@{raw})'
+        footer_text += f' · {name}'
         try:
             e.set_footer(text=footer_text, icon_url=requester.display_avatar.url)
         except Exception:
@@ -39,7 +43,11 @@ def queued(track: dict, position: int, requester: discord.Member = None) -> disc
     if track.get('duration'):
         e.add_field(name='Duration', value=format_duration(track['duration']), inline=True)
     if requester:
-        e.set_footer(text=f'Requested by {requester.display_name}', icon_url=requester.display_avatar.url)
+        name = requester.display_name
+        raw = getattr(requester, 'name', None)
+        if raw and raw != name:
+            name = f'{name} (@{raw})'
+        e.set_footer(text=f'Requested by {name}', icon_url=requester.display_avatar.url)
     return e
 
 
