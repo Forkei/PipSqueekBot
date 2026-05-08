@@ -26,7 +26,7 @@ class Playlist(commands.Cog):
 
     @commands.group(name='playlist', aliases=['pl'], invoke_without_command=True)
     async def playlist(self, ctx: commands.Context):
-        """Playlist management. Use `!playlist help` for subcommands."""
+        """Playlist management. Use `pip playlist help` for subcommands."""
         await ctx.send_help(ctx.command)
 
     @playlist.command(name='create')
@@ -171,11 +171,16 @@ class Playlist(commands.Cog):
             return
 
         p = get_player(ctx.guild.id)
+        try:
+            from discord.ext.voice_recv import VoiceRecvClient as _VRC
+            _cls = _VRC
+        except ImportError:
+            _cls = discord.VoiceClient
         if p.voice_client and p.voice_client.is_connected():
             if p.voice_client.channel != ctx.author.voice.channel:
                 await p.voice_client.move_to(ctx.author.voice.channel)
         else:
-            p.voice_client = await ctx.author.voice.channel.connect()
+            p.voice_client = await ctx.author.voice.channel.connect(cls=_cls)
 
         track_list = [dict(t) for t in tracks]
         if 'shuffle' in flags.lower():
@@ -204,7 +209,7 @@ class Playlist(commands.Cog):
             if music_cog and p.queue:
                 async with p._lock:
                     track = p.queue.popleft()
-                    await music_cog._play_track(ctx, p, track)
+                    await music_cog._play_track(ctx.guild.id, p, track)
 
     @playlist.command(name='privacy')
     async def pl_privacy(self, ctx: commands.Context, playlist_id: str, setting: str):

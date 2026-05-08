@@ -92,11 +92,16 @@ class SpotifyImport(commands.Cog):
                 return
 
             p = get_player(ctx.guild.id)
+            try:
+                from discord.ext.voice_recv import VoiceRecvClient as _VRC
+                _cls = _VRC
+            except ImportError:
+                _cls = discord.VoiceClient
             if p.voice_client and p.voice_client.is_connected():
                 if p.voice_client.channel != ctx.author.voice.channel:
                     await p.voice_client.move_to(ctx.author.voice.channel)
             else:
-                p.voice_client = await ctx.author.voice.channel.connect()
+                p.voice_client = await ctx.author.voice.channel.connect(cls=_cls)
 
             for t in resolved:
                 p.queue.append({**t, 'requester': ctx.author})
@@ -111,7 +116,7 @@ class SpotifyImport(commands.Cog):
                 if music_cog and p.queue:
                     async with p._lock:
                         track = p.queue.popleft()
-                        await music_cog._play_track(ctx, p, track)
+                        await music_cog._play_track(ctx.guild.id, p, track)
         else:
             # Save as a PipSqueek playlist
             playlist_id = await db.create_playlist(custom_name, ctx.author.id, ctx.author.display_name)

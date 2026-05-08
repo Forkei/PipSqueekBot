@@ -1,5 +1,4 @@
 import asyncio
-import functools
 import os
 import hashlib
 import yt_dlp
@@ -75,11 +74,11 @@ def _enforce_cache_limits():
 
 async def search_ytmusic(query: str, limit: int = 5) -> list[dict]:
     opts = {**YTDL_PLAYLIST_OPTIONS, 'noplaylist': True, 'default_search': 'ytsearch5'}
-    loop = asyncio.get_event_loop()
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = await loop.run_in_executor(
-            None, functools.partial(ydl.extract_info, f'ytsearch{limit}:{query}', download=False)
-        )
+    loop = asyncio.get_running_loop()
+    def _search():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(f'ytsearch{limit}:{query}', download=False)
+    info = await loop.run_in_executor(None, _search)
     if not info or 'entries' not in info:
         return []
     return [
@@ -96,15 +95,15 @@ async def search_ytmusic(query: str, limit: int = 5) -> list[dict]:
 
 
 async def extract_info(url: str) -> dict | None:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     opts = {**YTDL_FORMAT_OPTIONS, 'noplaylist': True, 'skip_download': True}
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        try:
-            info = await loop.run_in_executor(
-                None, functools.partial(ydl.extract_info, url, download=False)
-            )
-        except yt_dlp.utils.DownloadError:
-            return None
+    def _extract():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    try:
+        info = await loop.run_in_executor(None, _extract)
+    except yt_dlp.utils.DownloadError:
+        return None
     if not info:
         return None
     return {
@@ -118,14 +117,14 @@ async def extract_info(url: str) -> dict | None:
 
 
 async def extract_playlist(url: str) -> list[dict]:
-    loop = asyncio.get_event_loop()
-    with yt_dlp.YoutubeDL(YTDL_PLAYLIST_OPTIONS) as ydl:
-        try:
-            info = await loop.run_in_executor(
-                None, functools.partial(ydl.extract_info, url, download=False)
-            )
-        except yt_dlp.utils.DownloadError:
-            return []
+    loop = asyncio.get_running_loop()
+    def _extract():
+        with yt_dlp.YoutubeDL(YTDL_PLAYLIST_OPTIONS) as ydl:
+            return ydl.extract_info(url, download=False)
+    try:
+        info = await loop.run_in_executor(None, _extract)
+    except yt_dlp.utils.DownloadError:
+        return []
     if not info:
         return []
     entries = info.get('entries', [])
@@ -146,7 +145,7 @@ async def extract_playlist(url: str) -> list[dict]:
 
 
 async def download_and_get_path(url: str, video_id: str = None) -> str | None:
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     if video_id:
         cached = _cache_path_for_id(video_id)
@@ -155,13 +154,13 @@ async def download_and_get_path(url: str, video_id: str = None) -> str | None:
 
     _enforce_cache_limits()
 
-    with yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS) as ydl:
-        try:
-            info = await loop.run_in_executor(
-                None, functools.partial(ydl.extract_info, url, download=True)
-            )
-        except yt_dlp.utils.DownloadError:
-            return None
+    def _download():
+        with yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS) as ydl:
+            return ydl.extract_info(url, download=True)
+    try:
+        info = await loop.run_in_executor(None, _download)
+    except yt_dlp.utils.DownloadError:
+        return None
 
     if not info:
         return None

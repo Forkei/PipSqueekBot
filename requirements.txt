@@ -5,5 +5,8 @@ python-dotenv>=1.0.0
 aiohttp>=3.9.0
 aiosqlite>=0.20.0
 PyNaCl>=1.5.0
-google-genai>=1.0.0
 ddgs>=1.0
+
+# Voice assistant (optional — install for `pip listen` support)
+discord-ext-voice-recv>=0.7.0
+edge-tts>=6.1.9

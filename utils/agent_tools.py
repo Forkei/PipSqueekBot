@@ -27,15 +27,24 @@ class ToolContext:
 
 # ─── Tool Implementations ──────────────────────────────────────────────────────
 
+def _voice_client_cls():
+    try:
+        from discord.ext.voice_recv import VoiceRecvClient
+        return VoiceRecvClient
+    except ImportError:
+        return discord.VoiceClient
+
+
 async def _ensure_voice(tc: ToolContext) -> tuple[bool, str]:
     """Join voice if needed. Returns (success, error_message)."""
     from cogs.music import get_player
     p = get_player(tc.guild.id)
+    cls = _voice_client_cls()
 
     if tc.author and hasattr(tc.author, 'voice') and tc.author.voice:
         vc = tc.author.voice.channel
         if not p.voice_client or not p.voice_client.is_connected():
-            p.voice_client = await vc.connect()
+            p.voice_client = await vc.connect(cls=cls)
         elif p.voice_client.channel != vc:
             await p.voice_client.move_to(vc)
         p.text_channel = tc.channel
@@ -94,16 +103,17 @@ async def play_song(tc: ToolContext, query: str) -> str:
 
     async with p._lock:
         play_immediately = not (p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()))
-        if not play_immediately:
+        if play_immediately:
+            await music_cog._play_track(tc.guild.id, p, track)
+        else:
             p.queue.append(track)
             p.kick_predownload()
             queue_pos = len(p.queue)
 
     if play_immediately:
-        await music_cog._play_track(tc.guild.id, p, track)
-        return f'playing: "[{info["title"]}]({info["url"]})"'
+        return f'now playing: "[{info["title"]}]({info["url"]})"'
     else:
-        return f'queued: "[{info["title"]}]({info["url"]})" at position #{queue_pos}'
+        return f'enqueued at position #{queue_pos}: "[{info["title"]}]({info["url"]})"'
 
 
 async def skip_song(tc: ToolContext) -> str:
@@ -120,6 +130,7 @@ async def pause_playback(tc: ToolContext) -> str:
     p = get_player(tc.guild.id)
     if p.voice_client and p.voice_client.is_playing():
         p.voice_client.pause()
+        p.record_pause()
         return 'paused'
     return 'nothing playing'
 
@@ -129,6 +140,7 @@ async def resume_playback(tc: ToolContext) -> str:
     p = get_player(tc.guild.id)
     if p.voice_client and p.voice_client.is_paused():
         p.voice_client.resume()
+        p.record_resume()
         return 'resumed'
     return 'not paused'
 
@@ -150,7 +162,9 @@ async def set_volume(tc: ToolContext, volume: int) -> str:
     volume = max(0, min(100, volume))
     p = get_player(tc.guild.id)
     p.volume = volume / 100
-    return f'volume set to {volume}% (takes effect on next track)'
+    if p.voice_client and p.voice_client.source:
+        p.voice_client.source.volume = p.volume
+    return f'volume set to {volume}%'
 
 
 async def shuffle_queue(tc: ToolContext) -> str:
@@ -404,7 +418,7 @@ async def store_memory(tc: ToolContext, key: str, value: str) -> str:
     await db_store(tc.guild.id, key, value)
     taste_keywords = ('likes', 'loves', 'hates', 'prefers', 'genre', 'mood', 'vibe', 'taste', 'favorite', 'fan')
     if tc.author and any(kw in key.lower() or kw in value.lower() for kw in taste_keywords):
-        await store_taste_profile(tc.guild.id, tc.author.id, value)
+        await store_taste_profile(tc.author.id, value)
     return f'stored: {key} = {value}'
 
 
@@ -476,11 +490,11 @@ async def get_liked_songs(tc: ToolContext, user_name: str = None) -> str:
     from utils.database import get_liked_songs as db_liked, get_user_id_by_name
     if user_name:
         user_id = await get_user_id_by_name(tc.guild.id, user_name)
-        rows = await db_liked(tc.guild.id, user_id=user_id, limit=30)
+        rows = await db_liked(user_id=user_id, limit=30)
         if not rows:
             return f'no liked songs for {user_name}'
         return f"{user_name}'s liked songs:\n" + '\n'.join(f'[{r["title"]}]({r["url"]})' for r in rows)
-    rows = await db_liked(tc.guild.id, limit=60)
+    rows = await db_liked(limit=60)
     if not rows:
         return 'no liked songs yet'
     return '\n'.join(f'{r["user_name"]}: [{r["title"]}]({r["url"]})' for r in rows)
@@ -491,17 +505,16 @@ async def get_recommendations(tc: ToolContext) -> str:
     import json
     import re
     import os
+    import aiohttp
     from cogs.music import get_player
     from utils.database import get_liked_songs as db_liked, get_play_history, get_user_play_history
-    from google import genai
-    from google.genai import types
 
     p = get_player(tc.guild.id)
     vc_members = [m for m in p.voice_client.channel.members if not m.bot] if p.voice_client else []
 
     user_lines = []
     for member in vc_members:
-        liked = await db_liked(tc.guild.id, user_id=member.id, limit=20)
+        liked = await db_liked(user_id=member.id, limit=20)
         history = await get_user_play_history(tc.guild.id, member.id, limit=10)
         liked_titles = [r['title'] for r in liked]
         requested = [r['title'] for r in history if r['user_name'] != 'PipSqueek']
@@ -523,27 +536,39 @@ async def get_recommendations(tc: ToolContext) -> str:
                 'afternoon' if hour >= 12 else 'morning')
 
     prompt = (
-        f'You are a music recommendation engine for a Discord server. Time: {time_ctx}.\n'
+        f'Time: {time_ctx}.\n'
         f'Currently playing: {current_title or "nothing"}.\n'
         f'Recently played (avoid repeating): {", ".join(recent_titles) or "none"}.\n'
         f'Listeners:\n' + ('\n'.join(user_lines) if user_lines else '- no one in voice') + '\n\n'
-        f'Suggest 8 songs that fit this room right now. Consider the time of day and each '
+        f'Suggest 8 songs for this room right now. Consider the time of day and each '
         f'listener\'s taste. Vary the energy slightly. '
-        f'Return ONLY a JSON array: [{{"artist":"...", "title":"..."}}]'
+        f'Return: [{{"artist":"...", "title":"..."}}]'
     )
 
     try:
-        client = genai.Client(api_key=os.getenv('GEMINI_API_KEY', ''))
-        response = await client.aio.models.generate_content(
-            model='gemini-3.1-flash-lite-preview',
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.85, max_output_tokens=400),
-        )
-        text = (response.text or '').strip()
+        key = os.getenv('OPENROUTER_API_KEY', '').strip()
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                'model': 'meta-llama/llama-4-scout',
+                'messages': [
+                    {'role': 'system', 'content': 'You are a music recommendation engine. Return ONLY a JSON array, no explanation, no markdown fences.'},
+                    {'role': 'user', 'content': prompt},
+                ],
+                'temperature': 0.85,
+                'max_tokens': 400,
+            }
+            async with session.post(
+                'https://openrouter.ai/api/v1/chat/completions',
+                json=payload,
+                headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+            ) as resp:
+                data = await resp.json()
+        text = (data['choices'][0]['message']['content'] or '').strip()
         match = re.search(r'\[.*\]', text, re.DOTALL)
-        if not match:
-            return f'error: could not parse recommendations'
-        songs = json.loads(match.group())
+        if match:
+            songs = json.loads(match.group())
+        else:
+            songs = json.loads(f'[{text}]')
         suggestions = [f'{s["artist"]} - {s["title"]}' for s in songs if 'artist' in s and 'title' in s]
         return 'Recommended: ' + ' | '.join(suggestions[:8])
     except Exception as e:

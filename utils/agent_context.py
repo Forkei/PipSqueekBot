@@ -39,8 +39,8 @@ async def build_context(guild: discord.Guild, author: discord.Member | None = No
         if vc_members:
             parts.append('\nListeners taste:')
             for member in vc_members:
-                liked = await get_liked_songs(guild.id, user_id=member.id, limit=20)
-                profile = await get_taste_profile(guild.id, member.id)
+                liked = await get_liked_songs(user_id=member.id, limit=20)
+                profile = await get_taste_profile(member.id)
                 liked_titles = [r['title'] for r in liked]
                 line = f'  {_member_label(member)}'
                 if liked_titles:
@@ -98,7 +98,7 @@ async def build_context(guild: discord.Guild, author: discord.Member | None = No
             parts.append(f'  {key}: {val}')
 
     if author and not author.bot:
-        profile = await get_taste_profile(guild.id, author.id)
+        profile = await get_taste_profile(author.id)
         if profile:
             parts.append(f'\nTaste profile for {_member_label(author)}: {profile}')
 

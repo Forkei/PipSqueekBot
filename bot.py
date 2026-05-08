@@ -35,6 +35,7 @@ COGS = [
     'cogs.spotify_import',
     'cogs.help',
     'cogs.agent',
+    # 'cogs.voice_assistant',  # WIP — not ready yet
 ]
 
 

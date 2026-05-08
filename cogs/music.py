@@ -1,4 +1,5 @@
 import asyncio
+import os
 import random
 import time
 import discord
@@ -8,7 +9,7 @@ from utils import ytdl, embeds
 from utils.ytdl import format_duration
 
 LOOKAHEAD_DEPTH = 3
-OWNER_USERNAME = 'forkei'
+OWNER_USERNAME = os.getenv('OWNER_USERNAME', 'forkei')
 
 
 class NowPlayingView(discord.ui.View):
@@ -34,11 +35,23 @@ class NowPlayingView(discord.ui.View):
         p = get_player(self.guild_id)
         if p.voice_client and p.voice_client.is_playing():
             p.voice_client.pause()
+            p.record_pause()
             button.emoji = '▶️'
+            paused = True
         elif p.voice_client and p.voice_client.is_paused():
             p.voice_client.resume()
+            p.record_resume()
             button.emoji = '⏸️'
-        await interaction.response.edit_message(view=self)
+            paused = False
+        else:
+            await interaction.response.defer()
+            return
+        if p.current:
+            embed = embeds.now_playing(p.current, p.current.get('requester'),
+                                       elapsed=p.elapsed_seconds(), paused=paused)
+            await interaction.response.edit_message(embed=embed, view=self)
+        else:
+            await interaction.response.edit_message(view=self)
 
     @discord.ui.button(emoji='⏭️', style=discord.ButtonStyle.secondary)
     async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -64,10 +77,29 @@ class GuildPlayer:
         self.dj_mode: bool = False
         self.volume: float = 0.5
         self.play_start_time: float | None = None
+        self.paused_duration: float = 0.0
+        self.pause_start_time: float | None = None
         self.now_playing_msg: discord.Message | None = None
         self.last_human_msg_id: int = 0
         self._lock = asyncio.Lock()
         self._predownload_tasks: dict[str, asyncio.Task] = {}
+        self._progress_task: asyncio.Task | None = None
+
+    def elapsed_seconds(self) -> float:
+        if self.play_start_time is None:
+            return 0.0
+        t = time.time()
+        pause_adj = (t - self.pause_start_time) if self.pause_start_time is not None else 0.0
+        return max(0.0, t - self.play_start_time - self.paused_duration - pause_adj)
+
+    def record_pause(self):
+        if self.pause_start_time is None:
+            self.pause_start_time = time.time()
+
+    def record_resume(self):
+        if self.pause_start_time is not None:
+            self.paused_duration += time.time() - self.pause_start_time
+            self.pause_start_time = None
 
     def kick_predownload(self):
         for track in list(self.queue)[:LOOKAHEAD_DEPTH]:
@@ -77,6 +109,11 @@ class GuildPlayer:
                 self._predownload_tasks[vid_id] = task
 
     def clear(self):
+        if self._progress_task and not self._progress_task.done():
+            self._progress_task.cancel()
+        self._progress_task = None
+        self.paused_duration = 0.0
+        self.pause_start_time = None
         for task in self._predownload_tasks.values():
             if not task.done():
                 task.cancel()
@@ -103,16 +140,25 @@ class Music(commands.Cog):
     def _player(self, guild: discord.Guild) -> GuildPlayer:
         return get_player(guild.id)
 
+    @staticmethod
+    def _voice_cls():
+        try:
+            from discord.ext.voice_recv import VoiceRecvClient
+            return VoiceRecvClient
+        except ImportError:
+            return discord.VoiceClient
+
     async def _ensure_voice(self, ctx: commands.Context) -> bool:
         if not ctx.author.voice:
             await ctx.send(embed=embeds.error('You must be in a voice channel.'))
             return False
         p = self._player(ctx.guild)
+        cls = self._voice_cls()
         if p.voice_client and p.voice_client.is_connected():
             if p.voice_client.channel != ctx.author.voice.channel:
                 await p.voice_client.move_to(ctx.author.voice.channel)
         else:
-            p.voice_client = await ctx.author.voice.channel.connect()
+            p.voice_client = await ctx.author.voice.channel.connect(cls=cls)
         return True
 
     def _after_play(self, guild_id: int, error=None):
@@ -176,7 +222,12 @@ class Music(commands.Cog):
             p._predownload_tasks.pop(track.get('id'), None)
             p.current = track
             p.play_start_time = time.time()
-            source = discord.FFmpegOpusAudio(file_path, options=f'-af volume={p.volume}')
+            p.paused_duration = 0.0
+            p.pause_start_time = None
+            source = discord.PCMVolumeTransformer(
+                discord.FFmpegPCMAudio(file_path),
+                volume=p.volume,
+            )
             p.voice_client.play(source, after=lambda e: self._after_play(guild_id, e))
 
             duration = track.get('duration', 0)
@@ -189,7 +240,7 @@ class Music(commands.Cog):
             if p.text_channel:
                 requester_obj = track.get('requester')
                 requester_id = requester_obj.id if isinstance(requester_obj, discord.Member) else None
-                embed = embeds.now_playing(track, requester_obj)
+                embed = embeds.now_playing(track, requester_obj, elapsed=0.0)
                 # Edit in place if our message is still the most recent, otherwise resend silently
                 edited = False
                 old_msg = p.now_playing_msg
@@ -231,18 +282,42 @@ class Music(commands.Cog):
                 track.get('id', ''), track['title'], track['url']
             ))
 
+            if p._progress_task and not p._progress_task.done():
+                p._progress_task.cancel()
+            p._progress_task = asyncio.create_task(self._progress_loop(guild_id, p, track))
+
             if p.dj_mode:
-                asyncio.create_task(self._send_dj_comment(p, track['title'], previous_title))
+                asyncio.create_task(self._send_dj_comment(p.text_channel, track['title'], previous_title))
         except Exception as e:
             print(f'[music] Playback error: {type(e).__name__}: {e}')
             if p.text_channel:
                 await p.text_channel.send(embed=embeds.error(f'Playback failed: {e}'))
 
-    async def _send_dj_comment(self, p: GuildPlayer, current_title: str, previous_title: str = None):
+    async def _progress_loop(self, guild_id: int, p: GuildPlayer, track: dict):
+        track_url = track.get('url')
+        try:
+            while True:
+                await asyncio.sleep(10)
+                if not p.current or p.current.get('url') != track_url:
+                    break
+                if not p.now_playing_msg:
+                    break
+                elapsed = p.elapsed_seconds()
+                paused = p.pause_start_time is not None
+                embed = embeds.now_playing(p.current, p.current.get('requester'),
+                                           elapsed=elapsed, paused=paused)
+                try:
+                    await p.now_playing_msg.edit(embed=embed)
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    async def _send_dj_comment(self, channel, current_title: str, previous_title: str = None):
         from utils.gemini import dj_comment
         comment = await dj_comment(current_title, previous_title)
-        if comment and p.text_channel:
-            await p.text_channel.send(f'🎙️ {comment}')
+        if comment and channel:
+            await channel.send(f'🎙️ {comment}')
 
     # ──────────────────────────────── Commands ────────────────────────────────
 
@@ -327,6 +402,7 @@ class Music(commands.Cog):
         p = self._player(ctx.guild)
         if p.voice_client and p.voice_client.is_playing():
             p.voice_client.pause()
+            p.record_pause()
             await ctx.send(embed=embeds.success('Paused.'))
         else:
             await ctx.send(embed=embeds.error('Nothing is playing.'))
@@ -336,6 +412,7 @@ class Music(commands.Cog):
         p = self._player(ctx.guild)
         if p.voice_client and p.voice_client.is_paused():
             p.voice_client.resume()
+            p.record_resume()
             await ctx.send(embed=embeds.success('Resumed.'))
         else:
             await ctx.send(embed=embeds.error('Nothing is paused.'))
@@ -368,7 +445,9 @@ class Music(commands.Cog):
     async def nowplaying(self, ctx: commands.Context):
         p = self._player(ctx.guild)
         if p.current:
-            await ctx.send(embed=embeds.now_playing(p.current, p.current.get('requester')))
+            paused = p.pause_start_time is not None or bool(p.voice_client and p.voice_client.is_paused())
+            await ctx.send(embed=embeds.now_playing(p.current, p.current.get('requester'),
+                                                    elapsed=p.elapsed_seconds(), paused=paused))
         else:
             await ctx.send(embed=embeds.info('Nothing is playing right now.'))
 
@@ -379,7 +458,9 @@ class Music(commands.Cog):
             return
         p = self._player(ctx.guild)
         p.volume = vol / 100
-        await ctx.send(embed=embeds.success(f'Volume set to **{vol}%**. Takes effect on next track.'))
+        if p.voice_client and p.voice_client.source:
+            p.voice_client.source.volume = p.volume
+        await ctx.send(embed=embeds.success(f'Volume set to **{vol}%**.'))
 
     @commands.command(name='shuffle')
     async def shuffle(self, ctx: commands.Context):
@@ -416,13 +497,12 @@ class Music(commands.Cog):
 
     @commands.command(name='dj')
     async def dj(self, ctx: commands.Context):
-        """Toggle DJ mode — Gemini reacts to each song as it plays."""
+        """Toggle DJ mode — reacts to each song as it plays."""
         from utils.gemini import is_configured
         if not is_configured():
             await ctx.send(embed=embeds.error(
-                'DJ mode needs a Gemini API key.\n'
-                'Add `GEMINI_API_KEY=your_key` to your `.env`.\n'
-                'Get one free at <https://aistudio.google.com/>'
+                'DJ mode needs an OpenRouter API key.\n'
+                'Add `OPENROUTER_API_KEY=your_key` to your `.env`.'
             ))
             return
         p = self._player(ctx.guild)
@@ -481,7 +561,7 @@ class Music(commands.Cog):
             p.queue.append({**t, 'requester': ctx.author})
         p.kick_predownload()
 
-        playing_now = not (p.voice_client.is_playing() or p.voice_client.is_paused())
+        playing_now = not (p.voice_client and (p.voice_client.is_playing() or p.voice_client.is_paused()))
         msg = f'Added **{len(tracks)} tracks** to the queue.'
         if 'shuffle' in flags.lower():
             msg += ' (shuffled)'
@@ -577,10 +657,7 @@ class Music(commands.Cog):
         else:
             user_name = str(payload.user_id)
         from utils.database import like_song
-        await like_song(
-            payload.guild_id, payload.user_id, user_name,
-            track.get('id', ''), track['title'], track['url']
-        )
+        await like_song(payload.user_id, user_name, track.get('id', ''), track['title'], track['url'])
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
@@ -595,7 +672,7 @@ class Music(commands.Cog):
         if not track:
             return
         from utils.database import unlike_song
-        await unlike_song(payload.guild_id, payload.user_id, track.get('id', ''))
+        await unlike_song(payload.user_id, track.get('id', ''))
 
 
 async def setup(bot: commands.Bot):

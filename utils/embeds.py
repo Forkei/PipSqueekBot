@@ -9,13 +9,27 @@ PURPLE = 0x9C27B0
 GOLD = 0xFFD700
 
 
-def now_playing(track: dict, requester: discord.Member = None) -> discord.Embed:
+_BAR_WIDTH = 22
+
+
+def _progress_bar(elapsed: float, duration: float, paused: bool = False) -> str:
+    ratio = min(elapsed / duration, 1.0) if duration else 0.0
+    pos = min(round(ratio * _BAR_WIDTH), _BAR_WIDTH - 1)
+    bar = '━' * pos + '●' + '━' * (_BAR_WIDTH - 1 - pos)
+    icon = '⏸' if paused else '▶'
+    return f'{icon}  {format_duration(int(elapsed))}  {bar}  {format_duration(int(duration))}'
+
+
+def now_playing(track: dict, requester: discord.Member = None,
+                elapsed: float | None = None, paused: bool = False) -> discord.Embed:
     e = discord.Embed(title=track['title'], url=track.get('url'), color=PINK)
     e.set_author(name='Now Playing')
+    if elapsed is not None and track.get('duration'):
+        e.description = _progress_bar(elapsed, track['duration'], paused)
     if track.get('thumbnail'):
         e.set_thumbnail(url=track['thumbnail'])
     parts = []
-    if track.get('duration'):
+    if track.get('duration') and elapsed is None:
         parts.append(format_duration(track['duration']))
     if track.get('uploader'):
         parts.append(track['uploader'])

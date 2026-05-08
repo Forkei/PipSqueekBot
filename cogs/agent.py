@@ -1,15 +1,15 @@
 """
-PipSqueek Mk2 — Gemini-powered DJ agent (streaming ReAct).
+PipSqueek Mk2 — LLM-powered DJ agent (streaming ReAct).
 """
 import asyncio
 import json
 import os
 import re
 from collections import deque
+from dataclasses import dataclass
+import aiohttp
 import discord
 from discord.ext import commands
-from google import genai
-from google.genai import types
 
 from utils.agent_tools import ToolContext, dispatch
 from utils.agent_context import build_context
@@ -18,10 +18,12 @@ from utils import embeds
 _PREFIX = os.getenv('BOT_PREFIX', 'pip').strip() + ' '
 
 _PROMPT_PATH = os.path.join(os.path.dirname(__file__), '..', 'system_prompt.md')
-_SYSTEM_PROMPT = re.sub(r'\\([^a-zA-Z0-9])', r'\1', open(_PROMPT_PATH, encoding='utf-8').read())
+with open(_PROMPT_PATH, encoding='utf-8') as _f:
+    _SYSTEM_PROMPT = re.sub(r'\\([^a-zA-Z0-9])', r'\1', _f.read())
 
 MAX_ITERATIONS = 50
-_GEMINI_MODEL = 'gemini-3.1-pro-preview'
+_MODEL = 'deepseek/deepseek-chat-v3-0324'
+_OPENROUTER_BASE = 'https://openrouter.ai/api/v1'
 _CONV_MAX_ENTRIES = 240  # more entries now — each tool call is 2 turns
 
 # Tools whose single positional arg maps to this kwarg name
@@ -50,6 +52,37 @@ _SINGLE_PARAM = {
 }
 
 _TOOL_RE = re.compile(r'^\$([a-z_]+)\((.*)\)\$$', re.DOTALL)
+_MENTION_USER_RE = re.compile(r'<@!?(\d+)>')
+_MENTION_ROLE_RE = re.compile(r'<@&(\d+)>')
+_MENTION_CHAN_RE = re.compile(r'<#(\d+)>')
+
+
+@dataclass
+class _VoiceMessage:
+    """Stands in for a discord.Message when the trigger came from voice STT."""
+    guild_id: int
+    channel: discord.TextChannel
+    user: discord.Member
+    transcript: str
+
+
+def _resolve_mentions(content: str, guild: discord.Guild) -> str:
+    def _user(m):
+        member = guild.get_member(int(m.group(1)))
+        return f'@{member.name}' if member else m.group(0)
+
+    def _role(m):
+        role = guild.get_role(int(m.group(1)))
+        return f'@{role.name}' if role else m.group(0)
+
+    def _chan(m):
+        ch = guild.get_channel(int(m.group(1)))
+        return f'#{ch.name}' if ch else m.group(0)
+
+    content = _MENTION_USER_RE.sub(_user, content)
+    content = _MENTION_ROLE_RE.sub(_role, content)
+    content = _MENTION_CHAN_RE.sub(_chan, content)
+    return content
 
 _READ_ONLY_TOOLS = {
     'done', 'get_queue', 'get_now_playing', 'search_songs',
@@ -58,17 +91,11 @@ _READ_ONLY_TOOLS = {
     'get_liked_songs', 'get_recommendations',
 }
 
-_client: genai.Client | None = None
-
-
-def _get_gemini_client() -> genai.Client:
-    global _client
-    if _client is None:
-        api_key = os.getenv('GEMINI_API_KEY', '').strip()
-        if not api_key:
-            raise RuntimeError('GEMINI_API_KEY not set')
-        _client = genai.Client(api_key=api_key)
-    return _client
+def _get_openrouter_key() -> str:
+    key = os.getenv('OPENROUTER_API_KEY', '').strip()
+    if not key:
+        raise RuntimeError('OPENROUTER_API_KEY not set')
+    return key
 
 
 def _parse_tool_call(text: str) -> tuple[str, dict] | None:
@@ -103,6 +130,7 @@ class Agent(commands.Cog):
         self._running: set[int] = set()
         self._pending: dict[int, deque] = {}
         self._conversations: dict[int, list] = {}
+        self._session: aiohttp.ClientSession | None = None
 
     def _get_conversation(self, guild_id: int) -> list:
         return self._conversations.setdefault(guild_id, [])
@@ -113,6 +141,12 @@ class Agent(commands.Cog):
             self._conversations[guild_id] = conv[-_CONV_MAX_ENTRIES:]
 
     async def cog_load(self):
+        key = os.getenv('OPENROUTER_API_KEY', '').strip()
+        if key:
+            self._session = aiohttp.ClientSession(headers={
+                'Authorization': f'Bearer {key}',
+                'Content-Type': 'application/json',
+            })
         from utils.database import load_all_guild_configs
         rows = await load_all_guild_configs()
         for row in rows:
@@ -121,6 +155,10 @@ class Agent(commands.Cog):
                 self._agent_channel[row['guild_id']] = row['agent_channel_id']
         if rows:
             print(f'  [agent] Restored config for {len(rows)} guild(s)')
+
+    async def cog_unload(self):
+        if self._session:
+            await self._session.close()
 
     def get_mode(self, guild_id: int) -> str:
         return self._mode.get(guild_id, 'mk1')
@@ -148,10 +186,10 @@ class Agent(commands.Cog):
             await save_guild_config(guild_id, 'mk1', self._agent_channel.get(guild_id))
             await ctx.send(embed=embeds.success('Switched to **Mk1** — classic command mode.'))
         elif target == 'mk2':
-            if not os.getenv('GEMINI_API_KEY', '').strip():
+            if not os.getenv('OPENROUTER_API_KEY', '').strip():
                 await ctx.send(embed=embeds.error(
-                    'Mk2 needs a Gemini API key.\n'
-                    'Add `GEMINI_API_KEY=your_key` to `.env` and restart.'
+                    'Mk2 needs an OpenRouter API key.\n'
+                    'Add `OPENROUTER_API_KEY=your_key` to `.env` and restart.'
                 ))
                 return
             self._mode[guild_id] = 'mk2'
@@ -209,21 +247,16 @@ class Agent(commands.Cog):
 
         guild_id = message.guild.id
         mode = self.get_mode(guild_id)
-        print(f'[agent] msg from {message.author.display_name} | mode={mode} | channel={message.channel.id} | agent_ch={self._agent_channel.get(guild_id)}')
 
         if mode != 'mk2':
             return
 
         if not self._should_trigger(message, guild_id):
-            print(f'[agent] no trigger for: {message.content[:50]!r}')
             return
 
         if guild_id in self._running:
-            print(f'[agent] already running, queuing message')
             self._pending.setdefault(guild_id, deque()).append(message)
             return
-
-        print(f'[agent] triggering for: {message.content[:50]!r}')
         asyncio.create_task(self._run_agent(guild_id, message))
 
     def _should_trigger(self, message: discord.Message, guild_id: int) -> bool:
@@ -245,7 +278,7 @@ class Agent(commands.Cog):
 
     def _schedule_wakeup(self, guild_id: int, seconds: int):
         self._cancel_wakeup(guild_id)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         handle = loop.call_later(
             seconds,
             lambda: asyncio.create_task(self._wakeup_fire(guild_id))
@@ -257,7 +290,7 @@ class Agent(commands.Cog):
         handle = self._auto_wakeup_handles.pop(guild_id, None)
         if handle:
             handle.cancel()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         handle = loop.call_later(
             seconds,
             lambda: asyncio.create_task(self._wakeup_fire(guild_id))
@@ -281,29 +314,53 @@ class Agent(commands.Cog):
             return
         await self._run_agent(guild_id, message=None, is_wakeup=True, channel_override=channel)
 
+    # ─── Voice assistant entry point ───────────────────────────────────────────
+
+    async def run_from_voice(
+        self,
+        guild_id: int,
+        channel: discord.TextChannel,
+        user: discord.Member,
+        transcript: str,
+    ):
+        """Called by the voice assistant with a transcribed utterance."""
+        if guild_id in self._running:
+            # Queue it so it doesn't get dropped
+            fake_msg = _VoiceMessage(guild_id, channel, user, transcript)
+            self._pending.setdefault(guild_id, deque()).append(fake_msg)
+            return
+        asyncio.create_task(self._run_agent(guild_id, message=None,
+                                             voice_trigger=(channel, user, transcript)))
+
     # ─── Core agent loop ───────────────────────────────────────────────────────
 
     async def _run_agent(
         self,
         guild_id: int,
-        message: discord.Message | None,
+        message,  # discord.Message | _VoiceMessage | None
         is_wakeup: bool = False,
         channel_override: discord.TextChannel | None = None,
+        voice_trigger: tuple | None = None,
     ):
         if guild_id in self._running:
             return
         self._running.add(guild_id)
 
+        # Unwrap voice messages stored in the pending queue
+        if isinstance(message, _VoiceMessage):
+            voice_trigger = (message.channel, message.user, message.transcript)
+            message = None
+
         try:
-            await self._agent_loop(guild_id, message, is_wakeup, channel_override)
+            await self._agent_loop(guild_id, message, is_wakeup, channel_override, voice_trigger)
         except Exception as e:
             print(f'[agent] Unhandled error in guild {guild_id}: {type(e).__name__}: {e}')
         finally:
             self._running.discard(guild_id)
             pending = self._pending.get(guild_id)
             if pending:
-                next_msg = pending.popleft()
-                asyncio.create_task(self._run_agent(guild_id, next_msg))
+                next_item = pending.popleft()
+                asyncio.create_task(self._run_agent(guild_id, next_item))
 
     async def _agent_loop(
         self,
@@ -311,12 +368,15 @@ class Agent(commands.Cog):
         message: discord.Message | None,
         is_wakeup: bool,
         channel_override: discord.TextChannel | None,
+        voice_trigger: tuple | None = None,
     ):
         guild = self.bot.get_guild(guild_id)
         if not guild:
             return
 
-        if message:
+        if voice_trigger:
+            channel, author, transcript = voice_trigger
+        elif message:
             channel = message.channel
             author = message.author
         elif channel_override:
@@ -336,48 +396,96 @@ class Agent(commands.Cog):
         from utils.database import save_conversation_turn, upsert_user
         conv = self._get_conversation(guild_id)
 
-        if message and author:
+        if voice_trigger and author:
             await upsert_user(guild_id, author.id, author.display_name, author.name)
             display = author.display_name
             if author.name != display:
                 display = f'{display} (@{author.name})'
             trigger = {
+                'type': 'voice_message',
+                'username': display,
+                'text': transcript,
+            }
+            await save_conversation_turn(guild_id, 'user', transcript[:500], author.display_name, author.id)
+        elif message and author:
+            await upsert_user(guild_id, author.id, author.display_name, author.name)
+            display = author.display_name
+            if author.name != display:
+                display = f'{display} (@{author.name})'
+            text = _resolve_mentions(message.content, guild)
+            trigger = {
                 'type': 'user_message',
                 'username': display,
-                'text': message.content,
+                'text': text,
                 'uuid': str(message.id),
             }
-            await save_conversation_turn(guild_id, 'user', message.content[:500], author.display_name, author.id)
+            await save_conversation_turn(guild_id, 'user', text[:500], author.display_name, author.id)
         else:
             trigger = {'type': 'wakeup'}
             await save_conversation_turn(guild_id, 'system', '[wakeup]')
 
-        conv.append(types.Content(role='user', parts=[types.Part(text=json.dumps(trigger))]))
+        conv.append({'role': 'user', 'content': json.dumps(trigger)})
         self._trim_conversation(guild_id)
 
-        try:
-            client = _get_gemini_client()
-        except RuntimeError:
-            return
+        if not self._session:
+            try:
+                _get_openrouter_key()
+            except RuntimeError:
+                return
+            key = os.getenv('OPENROUTER_API_KEY', '').strip()
+            self._session = aiohttp.ClientSession(headers={
+                'Authorization': f'Bearer {key}',
+                'Content-Type': 'application/json',
+            })
 
-        async with channel.typing():
-            await self._agent_turns(guild_id, guild, channel, author, tc, client)
+        try:
+            async with channel.typing():
+                await self._agent_turns(guild_id, guild, channel, author, tc)
+        except discord.HTTPException as e:
+            if e.status == 429:
+                # Rate limited on typing indicator — proceed without it
+                await self._agent_turns(guild_id, guild, channel, author, tc)
+            else:
+                raise
 
     # ─── Streaming ReAct loop ──────────────────────────────────────────────────
+
+    async def _stream_openrouter(self, messages: list, system_prompt: str):
+        """Async generator yielding text chunks from OpenRouter SSE."""
+        payload = {
+            'model': _MODEL,
+            'messages': [{'role': 'system', 'content': system_prompt}] + messages,
+            'stream': True,
+            'temperature': 0.6,
+            'max_tokens': 8000,
+        }
+        async with self._session.post(
+            f'{_OPENROUTER_BASE}/chat/completions', json=payload
+        ) as resp:
+            async for raw in resp.content:
+                line = raw.decode('utf-8').strip()
+                if not line.startswith('data: ') or line == 'data: [DONE]':
+                    continue
+                try:
+                    data = json.loads(line[6:])
+                    delta = data['choices'][0]['delta'].get('content') or ''
+                    if delta:
+                        yield delta
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
 
     async def _consume_until_tool(self, stream) -> tuple[str, str | None, dict]:
         """
         Read stream until a complete $tool(args)$ is found or stream ends.
         Returns (text_accumulated_including_tool_call, tool_name_or_None, args_dict).
-        The tool call syntax is included at the end of the returned text.
         """
-        buf = ""       # all text so far (before + tool call)
-        tool_buf = ""  # current potential tool call being built
+        buf = ""
+        tool_buf = ""
         in_tool = False
 
         try:
             async for chunk in stream:
-                for ch in (chunk.text or ""):
+                for ch in chunk:
                     if not in_tool:
                         if ch == '$':
                             in_tool = True
@@ -386,14 +494,12 @@ class Agent(commands.Cog):
                             buf += ch
                     else:
                         tool_buf += ch
-                        # Complete tool call ends with )$
                         if ch == '$' and len(tool_buf) > 3 and tool_buf[-2] == ')':
                             parsed = _parse_tool_call(tool_buf)
                             if parsed:
                                 name, args = parsed
                                 return buf + tool_buf, name, args
                             else:
-                                # Not a valid tool, treat as plain text
                                 buf += tool_buf
                                 tool_buf = ""
                                 in_tool = False
@@ -409,7 +515,6 @@ class Agent(commands.Cog):
         channel,
         author,
         tc: ToolContext,
-        client,
     ):
         action_log: list[str] = []
         message_sent = False
@@ -418,30 +523,18 @@ class Agent(commands.Cog):
         conv = self._get_conversation(guild_id)
         assistant_text = ""  # grows into one big model message
 
-        for _iter in range(MAX_ITERATIONS):
-            status = await build_context(guild, author)
-            system_instruction = _SYSTEM_PROMPT + '\n\n' + status
+        status = await build_context(guild, author)
+        system_instruction = _SYSTEM_PROMPT + '\n\n' + status
 
-            # Pass conversation + current partial assistant turn as prefix
-            contents = list(conv)
+        for _iter in range(MAX_ITERATIONS):
+            messages = list(conv)
             if assistant_text:
-                contents.append(types.Content(
-                    role='model',
-                    parts=[types.Part(text=assistant_text)]
-                ))
+                messages.append({'role': 'assistant', 'content': assistant_text})
 
             try:
-                stream = await client.aio.models.generate_content_stream(
-                    model=_GEMINI_MODEL,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.6,
-                        max_output_tokens=8000,
-                    )
-                )
+                stream = self._stream_openrouter(messages, system_instruction)
             except Exception as e:
-                print(f'[agent] Gemini error: {type(e).__name__}: {e}')
+                print(f'[agent] OpenRouter error: {type(e).__name__}: {e}')
                 if _iter == 0:
                     await channel.send(f'something went wrong ({type(e).__name__})')
                 break
@@ -491,9 +584,8 @@ class Agent(commands.Cog):
         else:
             print(f'[agent] Hit max iterations ({MAX_ITERATIONS}) for guild {guild_id}')
 
-        # Store the full turn as one model Content
         if assistant_text:
-            conv.append(types.Content(role='model', parts=[types.Part(text=assistant_text)]))
+            conv.append({'role': 'assistant', 'content': assistant_text})
             self._trim_conversation(guild_id)
             print(f'[agent] assistant turn: {assistant_text[:300]!r}')
 
