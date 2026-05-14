@@ -61,11 +61,10 @@ async def on_message(message: discord.Message):
         if agent_cog.get_mode(guild_id) == 'mk2':
             content_lower = message.content.lower().strip()
             prefix_lower = PREFIX.lower()
-            # Allow pip mode and pip setchannel through as commands
-            if content_lower.startswith(prefix_lower + 'mode') or \
-               content_lower.startswith(prefix_lower + 'setchannel'):
+            if content_lower.startswith(prefix_lower):
+                # pip commands always run normally; agent ignores them
                 await bot.process_commands(message)
-            # All other messages: the agent's on_message listener handles it
+            # Non-prefix messages: the agent's on_message listener handles it
             return
 
     await bot.process_commands(message)

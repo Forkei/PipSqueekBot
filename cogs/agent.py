@@ -260,12 +260,13 @@ class Agent(commands.Cog):
         asyncio.create_task(self._run_agent(guild_id, message))
 
     def _should_trigger(self, message: discord.Message, guild_id: int) -> bool:
+        # pip-prefixed messages are handled as commands, not agent input
+        if message.content.lower().startswith(_PREFIX.lower()):
+            return False
         channel_id = self._agent_channel.get(guild_id)
         if channel_id and message.channel.id == channel_id:
             return True
         if self.bot.user in message.mentions:
-            return True
-        if message.content.lower().startswith(_PREFIX.lower()):
             return True
         return False
 
@@ -457,7 +458,8 @@ class Agent(commands.Cog):
             'messages': [{'role': 'system', 'content': system_prompt}] + messages,
             'stream': True,
             'temperature': 0.6,
-            'max_tokens': 8000,
+            'max_tokens': 1500,
+            'provider': {'order': ['DeepSeek', 'Together'], 'allow_fallbacks': True},
         }
         async with self._session.post(
             f'{_OPENROUTER_BASE}/chat/completions', json=payload
