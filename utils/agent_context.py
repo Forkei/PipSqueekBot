@@ -28,7 +28,11 @@ async def build_context(guild: discord.Guild, author: discord.Member | None = No
     p = get_player(guild.id)
     parts = []
 
-    parts.append(f'=== STATUS: {guild.name} | {time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())} ===')
+    parts.append(f'=== STATUS: {guild.name} | {time.strftime("%A %Y-%m-%d %H:%M")} (local time) ===')
+    if p.game_channel_id:
+        parts.append('A guess-the-song game is running right now. Music is on hold until it ends.')
+    if p.radio_mode:
+        parts.append('Radio mode is ON: you introduce tracks out loud between songs automatically.')
 
     parts.append('\nVoice channels with people:')
     parts.append(_voice_summary(guild))
@@ -101,5 +105,8 @@ async def build_context(guild: discord.Guild, author: discord.Member | None = No
         profile = await get_taste_profile(author.id)
         if profile:
             parts.append(f'\nTaste profile for {_member_label(author)}: {profile}')
+
+    from utils.persona import personality_block
+    parts.append('\n' + await personality_block(guild.id))
 
     return '\n'.join(parts)

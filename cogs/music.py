@@ -1,15 +1,63 @@
 import asyncio
 import os
 import random
+import re
 import time
 import discord
 from discord.ext import commands
 from collections import deque
-from utils import ytdl, embeds
+from utils import ytdl, embeds, persona
 from utils.ytdl import format_duration
 
 LOOKAHEAD_DEPTH = 3
-OWNER_USERNAME = os.getenv('OWNER_USERNAME', 'forkei')
+OWNER_USERNAME = os.getenv('OWNER_USERNAME', '')
+RADIO_TALK_CHANCE = 0.75  # radio mode: chance Pip talks before a given track
+
+
+_TS_RE = re.compile(r'^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$')
+
+
+def parse_timestamp(text: str) -> int | None:
+    """'1:30', '1:02:03', '90', '90s', '2m10s' → seconds. None if unparseable."""
+    text = text.strip().lower()
+    if not text:
+        return None
+    if ':' in text:
+        parts = text.split(':')
+        if not all(p.isdigit() for p in parts) or len(parts) > 3:
+            return None
+        secs = 0
+        for p in parts:
+            secs = secs * 60 + int(p)
+        return secs
+    m = _TS_RE.match(text)
+    if not m or not any(m.groups()):
+        return None
+    h, mi, s = (int(g) if g else 0 for g in m.groups())
+    return h * 3600 + mi * 60 + s
+
+
+def start_from_url(url: str) -> int:
+    """Read a YouTube ?t= / &start= timestamp from a URL (0 if none)."""
+    m = re.search(r'[?&#](?:t|start)=([0-9hms:]+)', url)
+    return (parse_timestamp(m.group(1)) or 0) if m else 0
+
+
+def make_source(path: str, volume: float, start: float = 0) -> discord.AudioSource:
+    before = f'-ss {start:.2f}' if start > 0 else None
+    return discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(path, before_options=before), volume=volume)
+
+
+def _is_pip(member) -> bool:
+    return bool(member and getattr(member, 'bot', False))
+
+
+def _label(member) -> str:
+    if not member or not hasattr(member, 'display_name'):
+        return '?'
+    if member.display_name == member.name:
+        return member.display_name
+    return f'{member.display_name} (@{member.name})'
 
 
 class NowPlayingView(discord.ui.View):
@@ -70,11 +118,14 @@ class GuildPlayer:
     def __init__(self):
         self.queue: deque[dict] = deque()
         self.current: dict | None = None
+        self.current_path: str | None = None  # cached audio file of the current track (for seeking)
         self.voice_client: discord.VoiceClient | None = None
         self.text_channel: discord.TextChannel | None = None
         self.loop_mode: str = 'off'
         self.autoplay: bool = False
         self.dj_mode: bool = False
+        self.radio_mode: bool = False
+        self.game_channel_id: int | None = None  # set while a guess-the-song game runs
         self.volume: float = 0.5
         self.play_start_time: float | None = None
         self.paused_duration: float = 0.0
@@ -84,6 +135,7 @@ class GuildPlayer:
         self._lock = asyncio.Lock()
         self._predownload_tasks: dict[str, asyncio.Task] = {}
         self._progress_task: asyncio.Task | None = None
+        self._radio_prefetch: dict[str, asyncio.Task] = {}  # track url → intro line task
 
     def elapsed_seconds(self) -> float:
         if self.play_start_time is None:
@@ -118,6 +170,10 @@ class GuildPlayer:
             if not task.done():
                 task.cancel()
         self._predownload_tasks.clear()
+        for task in self._radio_prefetch.values():
+            if not task.done():
+                task.cancel()
+        self._radio_prefetch.clear()
         self.queue.clear()
         self.current = None
         self.loop_mode = 'off'
@@ -150,7 +206,10 @@ class Music(commands.Cog):
 
     async def _ensure_voice(self, ctx: commands.Context) -> bool:
         if not ctx.author.voice:
-            await ctx.send(embed=embeds.error('You must be in a voice channel.'))
+            await ctx.send(embed=embeds.error(persona.line('not_in_voice')))
+            return False
+        if self._player(ctx.guild).game_channel_id:
+            await ctx.send(embed=embeds.info("game in progress. music can wait"))
             return False
         p = self._player(ctx.guild)
         cls = self._voice_cls()
@@ -166,8 +225,27 @@ class Music(commands.Cog):
             print(f'[music] Player error: {error}')
         asyncio.run_coroutine_threadsafe(self._advance(guild_id), self.bot.loop)
 
+    async def _record_if_skipped(self, guild_id: int, p: GuildPlayer):
+        """Called as a track ends: if it ended well before its duration, it was skipped."""
+        prev = p.current
+        if not prev or not prev.get('duration') or p.loop_mode == 'one':
+            return
+        if p.elapsed_seconds() >= prev['duration'] - 10:
+            return
+        req = prev.get('requester')
+        from utils.database import log_skip
+        await log_skip(guild_id, getattr(req, 'id', None), _label(req), prev.get('id'), prev['title'])
+        if _is_pip(req):
+            await persona.shift_mood(guild_id, -0.15, f'someone skipped your pick "{prev["title"]}"')
+
     async def _advance(self, guild_id: int):
         p = get_player(guild_id)
+        if p.game_channel_id:
+            return  # the game owns the voice client right now
+        try:
+            await self._record_if_skipped(guild_id, p)
+        except Exception as e:
+            print(f'[music] skip tracking failed: {e}')
         do_autoplay = False
         async with p._lock:
             if p.loop_mode == 'one' and p.current:
@@ -198,7 +276,6 @@ class Music(commands.Cog):
         if not p.current:
             return
         related = await ytdl.search_ytmusic(p.current['title'], limit=10)
-        related = [r for r in related if (r.get('duration') or 0) < 600]
         if not related:
             return
         pick = random.choice(related)
@@ -210,37 +287,37 @@ class Music(commands.Cog):
         file_path = await ytdl.download_and_get_path(track['url'], track.get('id'))
         if not file_path:
             if p.text_channel:
-                await p.text_channel.send(embed=embeds.error(f"Couldn't download **{track['title']}**. Skipping."))
+                await p.text_channel.send(embed=embeds.error(persona.line('download_failed', title=track['title'])))
             await self._advance(guild_id)
             return
 
         if not p.voice_client or not p.voice_client.is_connected():
             return
 
+        if p.radio_mode:
+            await self._radio_intro(guild_id, p, track)
+            if not p.voice_client or not p.voice_client.is_connected():
+                return
+
         try:
             previous_title = p.current['title'] if p.current else None
             p._predownload_tasks.pop(track.get('id'), None)
+            start = track.pop('start_at', 0) or 0  # one-shot: a looped replay starts from 0
+            if track.get('duration') and start >= track['duration']:
+                start = 0
             p.current = track
-            p.play_start_time = time.time()
+            p.current_path = file_path
+            p.play_start_time = time.time() - start
             p.paused_duration = 0.0
             p.pause_start_time = None
-            source = discord.PCMVolumeTransformer(
-                discord.FFmpegPCMAudio(file_path),
-                volume=p.volume,
-            )
-            p.voice_client.play(source, after=lambda e: self._after_play(guild_id, e))
-
-            duration = track.get('duration', 0)
-            if duration > 15:
-                wakeup_secs = max(30, int(duration * 0.95))
-                agent_cog = self.bot.cogs.get('Agent')
-                if agent_cog and agent_cog.get_mode(guild_id) == 'mk2':
-                    agent_cog.schedule_auto_wakeup(guild_id, wakeup_secs)
+            p.voice_client.play(make_source(file_path, p.volume, start),
+                                after=lambda e: self._after_play(guild_id, e))
+            self._schedule_song_end_wakeup(guild_id, p)
 
             if p.text_channel:
                 requester_obj = track.get('requester')
                 requester_id = requester_obj.id if isinstance(requester_obj, discord.Member) else None
-                embed = embeds.now_playing(track, requester_obj, elapsed=0.0)
+                embed = embeds.now_playing(track, requester_obj, elapsed=float(start))
                 # Edit in place if our message is still the most recent, otherwise resend silently
                 edited = False
                 old_msg = p.now_playing_msg
@@ -286,12 +363,121 @@ class Music(commands.Cog):
                 p._progress_task.cancel()
             p._progress_task = asyncio.create_task(self._progress_loop(guild_id, p, track))
 
-            if p.dj_mode:
-                asyncio.create_task(self._send_dj_comment(p.text_channel, track['title'], previous_title))
+            if p.radio_mode:
+                self._prefetch_radio_line(guild_id, p)
+            elif p.dj_mode:
+                asyncio.create_task(self._send_dj_comment(guild_id, p.text_channel, track, previous_title))
         except Exception as e:
             print(f'[music] Playback error: {type(e).__name__}: {e}')
             if p.text_channel:
-                await p.text_channel.send(embed=embeds.error(f'Playback failed: {e}'))
+                await p.text_channel.send(embed=embeds.error(persona.line('playback_failed')))
+
+    # ─── Radio host mode ───────────────────────────────────────────────────────
+
+    async def _make_radio_line(self, guild_id: int, track: dict, previous: dict | None) -> str | None:
+        if previous and random.random() > RADIO_TALK_CHANCE:
+            return None  # radio hosts don't talk before every single song
+        req = track.get('requester')
+        who = 'you picked it yourself' if _is_pip(req) else f'requested by {_label(req)}'
+        task = (
+            "You're on the mic between songs, like a radio host. "
+            + (f'The song that just ended: "{previous["title"]}". ' if previous else "It's the start of the session. ")
+            + f'Up next: "{track["title"]}" ({who}). '
+            'Say ONE short spoken line (max 20 words) to bring it in. It will be read aloud: '
+            'no emojis, no markdown, no links, no stage directions. Just the line.'
+        )
+        return await persona.one_liner(guild_id, task, max_tokens=80)
+
+    def _prefetch_radio_line(self, guild_id: int, p: GuildPlayer):
+        """Start writing the intro for the next queued track while the current one plays."""
+        if not p.queue:
+            return
+        nxt = p.queue[0]
+        url = nxt.get('url')
+        if url and url not in p._radio_prefetch:
+            p._radio_prefetch[url] = asyncio.create_task(
+                self._make_radio_line(guild_id, nxt, p.current)
+            )
+
+    async def _radio_intro(self, guild_id: int, p: GuildPlayer, track: dict):
+        from utils import tts
+        task = p._radio_prefetch.pop(track.get('url'), None)
+        try:
+            if task:
+                text = await asyncio.wait_for(task, timeout=8)
+            else:
+                text = await asyncio.wait_for(self._make_radio_line(guild_id, track, p.current), timeout=8)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            text = None
+        if not text:
+            return
+        if p.text_channel:
+            try:
+                await p.text_channel.send(f'📻 {text}', silent=True)
+            except Exception:
+                pass
+        try:
+            await tts.say(p.voice_client, text)
+        except Exception as e:
+            print(f'[radio] TTS failed: {type(e).__name__}: {e}')
+
+    def _schedule_song_end_wakeup(self, guild_id: int, p: GuildPlayer):
+        """Mk2: wake the agent shortly before the current song ends."""
+        duration = (p.current or {}).get('duration', 0)
+        if duration <= 15:
+            return
+        remaining = duration - p.elapsed_seconds()
+        agent_cog = self.bot.cogs.get('Agent')
+        if agent_cog and agent_cog.get_mode(guild_id) == 'mk2':
+            agent_cog.schedule_auto_wakeup(guild_id, max(5, int(remaining - duration * 0.05)))
+
+    async def seek_to(self, guild_id: int, target: str) -> str:
+        """Jump within the current track. target: '1:30', '90', '+30', '-15'. Returns a status string."""
+        p = get_player(guild_id)
+        vc = p.voice_client
+        if not p.current or not p.current_path or not vc or not (vc.is_playing() or vc.is_paused()):
+            return 'error: nothing playing'
+        target = target.strip()
+        relative = target[:1] in '+-'
+        secs = parse_timestamp(target.lstrip('+-'))
+        if secs is None:
+            return f'error: couldn\'t read "{target}" as a time. use 1:30, 90, +30 or -15'
+        now = p.elapsed_seconds()
+        pos = (now + secs if target[0] == '+' else now - secs) if relative else secs
+        duration = p.current.get('duration') or 0
+        pos = max(0.0, pos)
+        if duration and pos >= duration - 1:
+            return f'error: that\'s past the end (track is {format_duration(duration)})'
+
+        was_paused = vc.is_paused()
+        old = vc.source
+        vc.source = make_source(p.current_path, p.volume, pos)  # swaps in place, no "song ended" callback
+        if old:
+            old.cleanup()
+        p.play_start_time = time.time() - pos
+        p.paused_duration = 0.0
+        p.pause_start_time = None
+        if was_paused:
+            vc.pause()
+            p.record_pause()
+        self._schedule_song_end_wakeup(guild_id, p)
+        if p.now_playing_msg:
+            try:
+                await p.now_playing_msg.edit(embed=embeds.now_playing(
+                    p.current, p.current.get('requester'), elapsed=pos, paused=was_paused))
+            except Exception:
+                pass
+        return f'jumped to {format_duration(int(pos))} in "{p.current["title"]}"'
+
+    @commands.command(name='seek', aliases=['jump', 'goto'])
+    async def seek(self, ctx: commands.Context, *, position: str):
+        """Jump within the current song. Usage: pip seek 1:30 | pip seek +30 | pip seek -15"""
+        result = await self.seek_to(ctx.guild.id, position)
+        if result.startswith('error:'):
+            msg = result[6:].strip()
+            await ctx.send(embed=embeds.error(persona.line('nothing_playing') if msg == 'nothing playing' else msg))
+        else:
+            await ctx.message.add_reaction('⏩')
 
     async def _progress_loop(self, guild_id: int, p: GuildPlayer, track: dict):
         track_url = track.get('url')
@@ -313,9 +499,17 @@ class Music(commands.Cog):
         except asyncio.CancelledError:
             pass
 
-    async def _send_dj_comment(self, channel, current_title: str, previous_title: str = None):
-        from utils.gemini import dj_comment
-        comment = await dj_comment(current_title, previous_title)
+    async def _send_dj_comment(self, guild_id: int, channel, track: dict, previous_title: str = None):
+        req = track.get('requester')
+        task = (
+            f'A new song just started: "{track["title"]}"'
+            + (' (your own pick)' if _is_pip(req) else f' (requested by {_label(req)})') + '.'
+            + (f' The previous song was "{previous_title}".' if previous_title else '')
+            + ' Drop one short genuine comment about it, like a friend in the group chat. '
+            'If there is an obvious connection to the previous song, you can mention it. '
+            'Just the line, nothing else.'
+        )
+        comment = await persona.one_liner(guild_id, task, max_tokens=100)
         if comment and channel:
             await channel.send(f'🎙️ {comment}')
 
@@ -336,6 +530,9 @@ class Music(commands.Cog):
                 if not info:
                     await ctx.send(embed=embeds.error('Could not load that URL.'))
                     return
+                start = start_from_url(query)
+                if start:
+                    info['start_at'] = start
                 await self._queue_or_play(ctx, info)
             else:
                 results = await ytdl.search_ytmusic(query, limit=3)
@@ -405,7 +602,7 @@ class Music(commands.Cog):
             p.record_pause()
             await ctx.send(embed=embeds.success('Paused.'))
         else:
-            await ctx.send(embed=embeds.error('Nothing is playing.'))
+            await ctx.send(embed=embeds.error(persona.line('nothing_playing')))
 
     @commands.command(name='resume', aliases=['unpause'])
     async def resume(self, ctx: commands.Context):
@@ -424,7 +621,7 @@ class Music(commands.Cog):
             p.voice_client.stop()
             await ctx.send(embed=embeds.success('Skipped.'))
         else:
-            await ctx.send(embed=embeds.error('Nothing to skip.'))
+            await ctx.send(embed=embeds.error(persona.line('nothing_playing')))
 
     @commands.command(name='stop')
     async def stop(self, ctx: commands.Context):
@@ -498,11 +695,11 @@ class Music(commands.Cog):
     @commands.command(name='dj')
     async def dj(self, ctx: commands.Context):
         """Toggle DJ mode — reacts to each song as it plays."""
-        from utils.gemini import is_configured
+        from utils.llm import is_configured
         if not is_configured():
             await ctx.send(embed=embeds.error(
-                'DJ mode needs an OpenRouter API key.\n'
-                'Add `OPENROUTER_API_KEY=your_key` to your `.env`.'
+                'DJ mode needs an LLM API key.\n'
+                'Add `GEMINI_API_KEY` (or `OPENROUTER_API_KEY`) to your `.env`.'
             ))
             return
         p = self._player(ctx.guild)
@@ -511,6 +708,25 @@ class Music(commands.Cog):
             await ctx.send(embed=embeds.success('🎙️ DJ mode **on** — I\'ll react to every song.'))
         else:
             await ctx.send(embed=embeds.success('DJ mode **off**.'))
+
+    @commands.command(name='radio')
+    async def radio(self, ctx: commands.Context):
+        """Toggle radio host mode: Pip introduces tracks out loud between songs."""
+        from utils.llm import is_configured
+        from utils.tts import TTS_OK
+        if not is_configured() or not TTS_OK:
+            await ctx.send(embed=embeds.error(
+                'Radio mode needs `GEMINI_API_KEY` in `.env` and `pip install edge-tts`.'
+            ))
+            return
+        p = self._player(ctx.guild)
+        p.radio_mode = not p.radio_mode
+        p.text_channel = p.text_channel or ctx.channel
+        if p.radio_mode:
+            self._prefetch_radio_line(ctx.guild.id, p)
+            await ctx.send(embed=embeds.success("📻 radio mode **on**. i'll be on the mic between songs"))
+        else:
+            await ctx.send(embed=embeds.success('📻 radio mode **off**. back to silent professionalism'))
 
     @commands.command(name='remove', aliases=['rm'])
     async def remove(self, ctx: commands.Context, index: int):
@@ -658,6 +874,8 @@ class Music(commands.Cog):
             user_name = str(payload.user_id)
         from utils.database import like_song
         await like_song(payload.user_id, user_name, track.get('id', ''), track['title'], track['url'])
+        if _is_pip(track.get('requester')):
+            await persona.shift_mood(payload.guild_id, 0.15, f'{user_name} ❤️\'d your pick "{track["title"]}"')
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):

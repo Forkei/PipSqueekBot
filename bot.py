@@ -5,6 +5,7 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from utils.database import init_db
+from utils import persona
 
 # Force line-buffered output so logs appear immediately
 sys.stdout.reconfigure(line_buffering=True, errors='replace')
@@ -35,6 +36,8 @@ COGS = [
     'cogs.spotify_import',
     'cogs.help',
     'cogs.agent',
+    'cogs.games',
+    'cogs.fun',
     # 'cogs.voice_assistant',  # WIP — not ready yet
 ]
 
@@ -76,17 +79,18 @@ async def on_command_error(ctx: commands.Context, error):
         return
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(embed=discord.Embed(
-            description=f'❌ Missing argument: `{error.param.name}`. Use `pip help` for usage.',
+            description=f'❌ {persona.line("missing_arg", name=error.param.name)}',
             color=0xFF3D00
         ))
         return
     if isinstance(error, commands.BadArgument):
         await ctx.send(embed=discord.Embed(
-            description=f'❌ Bad argument: {error}',
+            description=f'❌ {persona.line("bad_arg")}',
             color=0xFF3D00
         ))
         return
-    raise error
+    print(f'[command] {ctx.command} failed: {type(error).__name__}: {error}')
+    await ctx.send(embed=discord.Embed(description=f'❌ {persona.line("crash")}', color=0xFF3D00))
 
 
 async def main():

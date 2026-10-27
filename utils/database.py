@@ -56,13 +56,10 @@ async def init_db():
             )
         ''')
         await db.execute('''
-            CREATE TABLE IF NOT EXISTS conversation_context (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                author_name TEXT,
-                timestamp INTEGER NOT NULL
+            CREATE TABLE IF NOT EXISTS agent_conversation (
+                guild_id INTEGER PRIMARY KEY,
+                messages_json TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
             )
         ''')
         await db.execute('''
@@ -109,17 +106,53 @@ async def init_db():
                 created_at INTEGER NOT NULL
             )
         ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS guild_kv (
+                guild_id INTEGER NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                PRIMARY KEY (guild_id, key)
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS lore (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                added_by TEXT,
+                created_at INTEGER NOT NULL
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS skip_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                requester_id INTEGER,
+                requester_name TEXT,
+                video_id TEXT,
+                title TEXT NOT NULL,
+                skipped_at INTEGER NOT NULL
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS game_scores (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_name TEXT NOT NULL,
+                points INTEGER NOT NULL DEFAULT 0,
+                wins INTEGER NOT NULL DEFAULT 0,
+                games INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, user_id)
+            )
+        ''')
         # Indexes
         await db.execute('CREATE INDEX IF NOT EXISTS idx_play_history_guild ON play_history(guild_id)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_play_history_guild_user ON play_history(guild_id, user_id)')
-        await db.execute('CREATE INDEX IF NOT EXISTS idx_conv_guild_ts ON conversation_context(guild_id, timestamp)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_lore_guild ON lore(guild_id)')
+        await db.execute('CREATE INDEX IF NOT EXISTS idx_skip_log_guild ON skip_log(guild_id, skipped_at)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_liked_songs_user ON liked_songs(user_id)')
         await db.execute('CREATE INDEX IF NOT EXISTS idx_agent_memory_guild ON agent_memory(guild_id)')
         # Migrations
-        try:
-            await db.execute('ALTER TABLE conversation_context ADD COLUMN author_id INTEGER')
-        except Exception:
-            pass
         try:
             await db.execute('ALTER TABLE users ADD COLUMN username TEXT')
         except Exception:
@@ -345,10 +378,7 @@ async def delete_memory(guild_id: int, key: str):
         await db.commit()
 
 
-# ─── Conversation Context ──────────────────────────────────────────────────────
-
-CONTEXT_LIMIT = 30
-
+# ─── Users ─────────────────────────────────────────────────────────────────────
 
 async def upsert_user(guild_id: int, user_id: int, display_name: str, username: str = None):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -373,38 +403,178 @@ async def get_user_id_by_name(guild_id: int, name: str) -> int | None:
             return row[0] if row else None
 
 
-async def save_conversation_turn(guild_id: int, role: str, content: str,
-                                  author_name: str = None, author_id: int = None):
+async def get_guild_user_ids(guild_id: int) -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT user_id FROM users WHERE guild_id = ?', (guild_id,)) as cursor:
+            return [r[0] for r in await cursor.fetchall()]
+
+
+# ─── Agent Conversation (persisted across restarts) ────────────────────────────
+
+async def save_agent_conversation(guild_id: int, messages_json: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            'INSERT INTO conversation_context (guild_id, role, content, author_name, author_id, timestamp) '
-            'VALUES (?, ?, ?, ?, ?, ?)',
-            (guild_id, role, content, author_name, author_id, int(time.time()))
-        )
-        await db.execute(
-            'DELETE FROM conversation_context WHERE guild_id = ? AND id NOT IN '
-            '(SELECT id FROM conversation_context WHERE guild_id = ? ORDER BY timestamp DESC LIMIT ?)',
-            (guild_id, guild_id, CONTEXT_LIMIT)
+            'INSERT INTO agent_conversation (guild_id, messages_json, updated_at) VALUES (?, ?, ?) '
+            'ON CONFLICT(guild_id) DO UPDATE SET messages_json=excluded.messages_json, updated_at=excluded.updated_at',
+            (guild_id, messages_json, int(time.time()))
         )
         await db.commit()
 
 
-async def get_conversation_history(guild_id: int, limit: int = CONTEXT_LIMIT) -> list:
+async def load_agent_conversations() -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute('SELECT guild_id, messages_json FROM agent_conversation') as cursor:
+            return await cursor.fetchall()
+
+
+async def clear_agent_conversation(guild_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('DELETE FROM agent_conversation WHERE guild_id = ?', (guild_id,))
+        await db.commit()
+
+
+# ─── Guild key/value (mood, wrapped schedule, ...) ─────────────────────────────
+
+async def kv_get(guild_id: int, key: str) -> str | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT value FROM guild_kv WHERE guild_id = ? AND key = ?', (guild_id, key)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
+
+
+async def kv_set(guild_id: int, key: str, value: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'INSERT INTO guild_kv (guild_id, key, value) VALUES (?, ?, ?) '
+            'ON CONFLICT(guild_id, key) DO UPDATE SET value=excluded.value',
+            (guild_id, key, value)
+        )
+        await db.commit()
+
+
+# ─── Lore ──────────────────────────────────────────────────────────────────────
+
+async def add_lore(guild_id: int, content: str, added_by: str = None) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            'INSERT INTO lore (guild_id, content, added_by, created_at) VALUES (?, ?, ?, ?)',
+            (guild_id, content, added_by, int(time.time()))
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def list_lore(guild_id: int) -> list:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            'SELECT role, content, author_name, timestamp FROM conversation_context '
-            'WHERE guild_id = ? ORDER BY timestamp ASC',
-            (guild_id,)
+            'SELECT * FROM lore WHERE guild_id = ? ORDER BY created_at DESC', (guild_id,)
         ) as cursor:
-            rows = await cursor.fetchall()
-            return list(rows)[-limit:]
+            return await cursor.fetchall()
 
 
-async def clear_conversation_history(guild_id: int):
+async def delete_lore(guild_id: int, lore_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('DELETE FROM conversation_context WHERE guild_id = ?', (guild_id,))
+        cur = await db.execute('DELETE FROM lore WHERE guild_id = ? AND id = ?', (guild_id, lore_id))
         await db.commit()
+        return cur.rowcount > 0
+
+
+# ─── Skips ─────────────────────────────────────────────────────────────────────
+
+async def log_skip(guild_id: int, requester_id: int | None, requester_name: str | None,
+                   video_id: str | None, title: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'INSERT INTO skip_log (guild_id, requester_id, requester_name, video_id, title, skipped_at) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (guild_id, requester_id, requester_name, video_id, title, int(time.time()))
+        )
+        await db.commit()
+
+
+# ─── Stats (Wrapped / roast) ───────────────────────────────────────────────────
+
+async def _rows(query: str, params: tuple) -> list:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(query, params) as cursor:
+            return await cursor.fetchall()
+
+
+async def top_songs(guild_id: int, since: int, limit: int = 5) -> list:
+    return await _rows(
+        'SELECT title, COUNT(*) AS n FROM play_history WHERE guild_id = ? AND played_at >= ? '
+        'GROUP BY lower(title) ORDER BY n DESC LIMIT ?', (guild_id, since, limit))
+
+
+async def top_requesters(guild_id: int, since: int, bot_id: int, limit: int = 5) -> list:
+    return await _rows(
+        'SELECT user_name, user_id, COUNT(*) AS n FROM play_history '
+        'WHERE guild_id = ? AND played_at >= ? AND user_id != ? '
+        'GROUP BY user_id ORDER BY n DESC LIMIT ?', (guild_id, since, bot_id, limit))
+
+
+async def play_counts(guild_id: int, since: int, bot_id: int) -> dict:
+    rows = await _rows(
+        'SELECT COUNT(*) AS total, COUNT(DISTINCT lower(title)) AS uniq, '
+        'SUM(CASE WHEN user_id = ? THEN 1 ELSE 0 END) AS pip '
+        'FROM play_history WHERE guild_id = ? AND played_at >= ?', (bot_id, guild_id, since))
+    r = rows[0]
+    return {'total': r['total'] or 0, 'unique': r['uniq'] or 0, 'pip': r['pip'] or 0}
+
+
+async def most_skipped(guild_id: int, since: int, limit: int = 3) -> list:
+    return await _rows(
+        'SELECT title, requester_name, COUNT(*) AS n FROM skip_log WHERE guild_id = ? AND skipped_at >= ? '
+        'GROUP BY lower(title) ORDER BY n DESC LIMIT ?', (guild_id, since, limit))
+
+
+async def skip_count_for_user(guild_id: int, user_id: int) -> int:
+    rows = await _rows(
+        'SELECT COUNT(*) AS n FROM skip_log WHERE guild_id = ? AND requester_id = ?', (guild_id, user_id))
+    return rows[0]['n'] or 0
+
+
+async def requests_in_window(guild_id: int, since: int, bot_id: int, limit: int = 60) -> list:
+    return await _rows(
+        'SELECT user_name, title FROM play_history WHERE guild_id = ? AND played_at >= ? AND user_id != ? '
+        'ORDER BY played_at DESC LIMIT ?', (guild_id, since, bot_id, limit))
+
+
+async def most_liked(user_ids: list[int], since: int, limit: int = 3) -> list:
+    if not user_ids:
+        return []
+    marks = ','.join('?' * len(user_ids))
+    return await _rows(
+        f'SELECT title, COUNT(*) AS n FROM liked_songs WHERE user_id IN ({marks}) AND liked_at >= ? '
+        f'GROUP BY video_id ORDER BY n DESC LIMIT ?', (*user_ids, since, limit))
+
+
+# ─── Game Scores ───────────────────────────────────────────────────────────────
+
+async def add_game_result(guild_id: int, user_id: int, user_name: str, points: int, won: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            'INSERT INTO game_scores (guild_id, user_id, user_name, points, wins, games) VALUES (?, ?, ?, ?, ?, 1) '
+            'ON CONFLICT(guild_id, user_id) DO UPDATE SET user_name=excluded.user_name, '
+            'points=points+excluded.points, wins=wins+excluded.wins, games=games+1',
+            (guild_id, user_id, user_name, points, 1 if won else 0)
+        )
+        await db.commit()
+
+
+async def game_leaderboard(guild_id: int, limit: int = 10) -> list:
+    return await _rows(
+        'SELECT * FROM game_scores WHERE guild_id = ? ORDER BY points DESC LIMIT ?', (guild_id, limit))
+
+
+async def game_score_for(guild_id: int, user_id: int):
+    rows = await _rows('SELECT * FROM game_scores WHERE guild_id = ? AND user_id = ?', (guild_id, user_id))
+    return rows[0] if rows else None
 
 
 # ─── Taste Profiles ────────────────────────────────────────────────────────────

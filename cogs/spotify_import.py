@@ -1,4 +1,3 @@
-import asyncio
 import discord
 from discord.ext import commands
 from utils import spotify as sp_utils, ytdl, database as db, embeds

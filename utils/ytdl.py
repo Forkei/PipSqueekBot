@@ -1,6 +1,5 @@
 import asyncio
 import os
-import hashlib
 import yt_dlp
 from dotenv import load_dotenv
 

@@ -14,7 +14,6 @@ import io
 import os
 import struct
 import time
-import tempfile
 import wave
 import aiohttp
 import discord
@@ -31,11 +30,8 @@ except ImportError:
     VOICE_RECV_OK = False
     VoiceRecvClient = discord.VoiceClient  # fallback type alias only
 
-try:
-    import edge_tts
-    EDGE_TTS_OK = True
-except ImportError:
-    EDGE_TTS_OK = False
+from utils import tts
+EDGE_TTS_OK = tts.TTS_OK
 
 # ─── Audio constants ──────────────────────────────────────────────────────────
 
@@ -48,8 +44,6 @@ _VOICE_RMS_THRESHOLD = 800    # amplitude out of 32768
 _SILENCE_TIMEOUT = 1.5         # seconds of silence → end of utterance
 _MAX_UTTERANCE_SECS = 12.0     # hard cap
 _MIN_UTTERANCE_SECS = 0.4      # discard shorter clips (noise)
-
-_TTS_VOICE = 'en-US-AvaMultilingualNeural'
 
 
 # ─── Audio helpers ─────────────────────────────────────────────────────────────
@@ -188,65 +182,15 @@ async def _transcribe(pcm_bytes: bytes) -> str | None:
     return None
 
 
-# ─── TTS via edge-tts ────────────────────────────────────────────────────────
+# ─── TTS ───────────────────────────────────────────────────────────────────────
 
-async def _synthesize(text: str) -> bytes | None:
-    if not EDGE_TTS_OK:
-        return None
-    try:
-        communicate = edge_tts.Communicate(text, _TTS_VOICE)
-        mp3_buf = bytearray()
-        async for chunk in communicate.stream():
-            if chunk['type'] == 'audio':
-                mp3_buf.extend(chunk['data'])
-        return bytes(mp3_buf) if mp3_buf else None
-    except Exception as e:
-        print(f'[voice] TTS error: {type(e).__name__}: {e}')
-        return None
-
-
-async def _play_tts(p, mp3_bytes: bytes):
-    """Play TTS audio; ducks music while playing, restores after."""
+async def _play_tts(p, text: str):
+    """Speak text in voice. Skipped while music plays (discord.py can't mix streams)."""
     if not (p.voice_client and p.voice_client.is_connected()):
         return
-
-    loop = asyncio.get_running_loop()
-    original_vol = p.volume
-    music_playing = p.voice_client.is_playing() or p.voice_client.is_paused()
-
-    with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
-        f.write(mp3_bytes)
-        tmp_path = f.name
-
-    try:
-        if music_playing:
-            # Duck music to 15% while TTS plays
-            if p.voice_client.source:
-                p.voice_client.source.volume = original_vol * 0.15
-
-        tts_done = asyncio.Event()
-
-        def _after(_err):
-            loop.call_soon_threadsafe(tts_done.set)
-
-        tts_source = discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(tmp_path),
-            volume=0.9,
-        )
-
-        if not music_playing:
-            p.voice_client.play(tts_source, after=_after)
-            await tts_done.wait()
-        else:
-            # Can't mix audio streams in discord.py — skip audio, text already sent
-            pass
-    finally:
-        if music_playing and p.voice_client and p.voice_client.source:
-            p.voice_client.source.volume = original_vol
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+    if p.voice_client.is_playing() or p.voice_client.is_paused():
+        return
+    await tts.say(p.voice_client, text)
 
 
 # ─── Cog ─────────────────────────────────────────────────────────────────────
@@ -378,17 +322,14 @@ class VoiceAssistant(commands.Cog):
             return
         if message.channel.id != self._text_channels.get(guild_id, 0):
             return
-        # Don't TTS the transcript echo (starts with 🎙️)
-        if message.content.startswith('🎙️'):
+        # Don't TTS the transcript echo (🎙️) or radio lines (📻, already spoken)
+        if message.content.startswith(('🎙️', '📻')):
             return
         text = message.content
         if not text:
             return
-        mp3 = await _synthesize(text)
-        if mp3:
-            from cogs.music import get_player
-            p = get_player(guild_id)
-            await _play_tts(p, mp3)
+        from cogs.music import get_player
+        await _play_tts(get_player(guild_id), text)
 
     @commands.Cog.listener()
     async def on_voice_state_update(

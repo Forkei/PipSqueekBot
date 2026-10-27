@@ -20,6 +20,8 @@ class ToolContext:
     author: discord.Member | None
     bot: 'commands.Bot'
     trigger_message: discord.Message | None = None
+    # play_song lookups started in parallel before tools run sequentially (query → task)
+    prefetch: dict = field(default_factory=dict, init=False)
     _wakeup_scheduled: bool = field(default=False, init=False)
     _wakeup_seconds: int = field(default=0, init=False)
     _wakeup_cancel: bool = field(default=False, init=False)
@@ -55,32 +57,33 @@ async def _ensure_voice(tc: ToolContext) -> tuple[bool, str]:
     return False, 'no voice channel available'
 
 
-_MAX_PLAY_DURATION = 600  # 10 minutes — skip mixes/compilations
-
-
-async def play_song(tc: ToolContext, query: str) -> str:
-    from cogs.music import get_player
+async def resolve_track(query: str) -> dict | str:
+    """Look up a song. Returns track info, or an 'error: ...' string."""
     from utils import ytdl
+    if query.startswith('http'):
+        info = await ytdl.extract_info(query)
+    else:
+        results = await ytdl.search_ytmusic(query, limit=1)
+        info = results[0] if results else None
+    return info or f'error: nothing found for "{query}"'
+
+
+async def play_song(tc: ToolContext, query: str, start: str | None = None) -> str:
+    from cogs.music import get_player
+
+    p = get_player(tc.guild.id)
+    if p.game_channel_id:
+        return 'error: a guess-the-song game is running, music is on hold until it ends'
 
     ok, err = await _ensure_voice(tc)
     if not ok:
         return f'error: {err}'
-
-    p = get_player(tc.guild.id)
     p.text_channel = tc.channel
 
-    if query.startswith('http'):
-        info = await ytdl.extract_info(query)
-        if info and info.get('duration', 0) > _MAX_PLAY_DURATION:
-            return f'error: "{info["title"]}" is too long ({info["duration"]}s) — looks like a mix/compilation'
-    else:
-        results = await ytdl.search_ytmusic(query, limit=5)
-        info = next((r for r in results if r.get('duration', 0) <= _MAX_PLAY_DURATION), None)
-        if not info and results:
-            info = min(results, key=lambda r: r.get('duration', 9999))
-
-    if not info:
-        return f'error: nothing found for "{query}"'
+    task = tc.prefetch.pop(query, None)
+    info = await task if task else await resolve_track(query)
+    if isinstance(info, str):
+        return info
 
     # Dedup only for non-user-initiated plays (wakeups, autoplay)
     user_initiated = tc.author is not None and tc.trigger_message is not None
@@ -96,6 +99,10 @@ async def play_song(tc: ToolContext, query: str) -> str:
             return f'skipped: "{info["title"]}" was recently played'
 
     track = {**info, 'requester': tc.author or tc.guild.me}
+    from cogs.music import parse_timestamp, start_from_url
+    start_at = (parse_timestamp(start) if start else None) or (start_from_url(query) if query.startswith('http') else 0)
+    if start_at:
+        track['start_at'] = start_at
 
     music_cog = tc.bot.cogs.get('Music')
     if not music_cog:
@@ -114,6 +121,13 @@ async def play_song(tc: ToolContext, query: str) -> str:
         return f'now playing: "[{info["title"]}]({info["url"]})"'
     else:
         return f'enqueued at position #{queue_pos}: "[{info["title"]}]({info["url"]})"'
+
+
+async def seek(tc: ToolContext, position: str) -> str:
+    music_cog = tc.bot.cogs.get('Music')
+    if not music_cog:
+        return 'error: music cog not loaded'
+    return await music_cog.seek_to(tc.guild.id, position)
 
 
 async def skip_song(tc: ToolContext) -> str:
@@ -458,7 +472,9 @@ async def cancel_wakeup(tc: ToolContext) -> str:
 
 
 async def send_message(tc: ToolContext, content: str) -> str:
+    from utils.persona import remember_remark
     await tc.channel.send(content)
+    remember_remark(tc.guild.id, content)
     return 'sent'
 
 
@@ -504,8 +520,6 @@ async def get_recommendations(tc: ToolContext) -> str:
     import datetime
     import json
     import re
-    import os
-    import aiohttp
     from cogs.music import get_player
     from utils.database import get_liked_songs as db_liked, get_play_history, get_user_play_history
 
@@ -545,25 +559,14 @@ async def get_recommendations(tc: ToolContext) -> str:
         f'Return: [{{"artist":"...", "title":"..."}}]'
     )
 
+    from utils import llm
     try:
-        key = os.getenv('OPENROUTER_API_KEY', '').strip()
-        async with aiohttp.ClientSession() as session:
-            payload = {
-                'model': 'meta-llama/llama-4-scout',
-                'messages': [
-                    {'role': 'system', 'content': 'You are a music recommendation engine. Return ONLY a JSON array, no explanation, no markdown fences.'},
-                    {'role': 'user', 'content': prompt},
-                ],
-                'temperature': 0.85,
-                'max_tokens': 400,
-            }
-            async with session.post(
-                'https://openrouter.ai/api/v1/chat/completions',
-                json=payload,
-                headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
-            ) as resp:
-                data = await resp.json()
-        text = (data['choices'][0]['message']['content'] or '').strip()
+        text = await llm.chat(
+            'You are a music recommendation engine. Return ONLY a JSON array, no explanation, no markdown fences.',
+            prompt, max_tokens=500,
+        )
+        if not text:
+            return 'error: recommendation call failed'
         match = re.search(r'\[.*\]', text, re.DOTALL)
         if match:
             songs = json.loads(match.group())
@@ -605,14 +608,32 @@ async def leave_note(tc: ToolContext, content: str) -> str:
     return 'note saved'
 
 
-async def done(tc: ToolContext) -> str:
-    return 'done'
+async def add_lore(tc: ToolContext, content: str) -> str:
+    from utils.database import add_lore as db_add
+    added_by = tc.author.display_name if tc.author else 'Pip'
+    lore_id = await db_add(tc.guild.id, content, added_by)
+    return f'lore #{lore_id} saved'
+
+
+async def shift_mood(tc: ToolContext, direction: str, reason: str) -> str:
+    from utils.persona import shift_mood as persona_shift
+    delta = 0.2 if direction == 'up' else -0.2
+    await persona_shift(tc.guild.id, delta, reason)
+    return f'mood nudged {direction}'
+
+
+async def start_guess_game(tc: ToolContext, rounds: int = 5) -> str:
+    games = tc.bot.cogs.get('Games')
+    if not games:
+        return 'error: games cog not loaded'
+    return await games.start_from_agent(tc.guild, tc.channel, tc.author, rounds)
 
 
 # ─── Dispatch table ────────────────────────────────────────────────────────────
 
 TOOL_HANDLERS = {
     'play_song': play_song,
+    'seek': seek,
     'skip_song': skip_song,
     'pause_playback': pause_playback,
     'resume_playback': resume_playback,
@@ -649,7 +670,9 @@ TOOL_HANDLERS = {
     'web_search': web_search,
     'sleep': sleep,
     'leave_note': leave_note,
-    'done': done,
+    'add_lore': add_lore,
+    'shift_mood': shift_mood,
+    'start_guess_game': start_guess_game,
 }
 
 

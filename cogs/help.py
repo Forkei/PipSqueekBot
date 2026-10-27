@@ -10,6 +10,7 @@ HELP_PAGES = {
             ('pip play <song or url>', 'Play a song from YouTube (search or URL)'),
             ('pip pause / pip resume', 'Pause or resume playback'),
             ('pip skip', 'Skip the current song'),
+            ('pip seek <time>', 'Jump within the song: `1:30`, `90`, `+30` (forward) or `-15` (back)'),
             ('pip stop', 'Stop and disconnect from voice'),
             ('pip nowplaying', 'Show the currently playing song'),
             ('pip queue [page]', 'Show the song queue'),
@@ -23,6 +24,22 @@ HELP_PAGES = {
             ('pip clear', 'Clear the queue without stopping'),
             ('pip album <url> [shuffle]', 'Queue a full YouTube playlist or album'),
             ('pip join / pip leave', 'Join or leave your voice channel'),
+            ('pip dj', 'Toggle DJ comments as each song starts'),
+            ('pip radio', 'Toggle radio host mode — Pip introduces tracks out loud'),
+        ]
+    },
+    'fun': {
+        'title': '🎧 Fun Commands',
+        'color': embeds.GOLD,
+        'fields': [
+            ('pip guess [rounds]', 'Guess the song — Pip picks, you guess. Title 2 pts, artist 1 pt'),
+            ('pip guess stop / pip guess top', 'End the game / all-time leaderboard'),
+            ('pip wrapped [week/month/all]', 'Server music recap with Pip\'s commentary'),
+            ('pip wrapped auto [on/off]', 'Toggle the Sunday-evening auto post'),
+            ('pip roast [@user]', 'Pip roasts someone\'s music taste'),
+            ('pip mood', 'How Pip\'s feeling, and why'),
+            ('pip lore / lore add <text> / lore remove <#>', 'The server lore Pip remembers'),
+            ('pip forget', 'Wipe Pip\'s conversation memory (lore and mood stay)'),
         ]
     },
     'playlist': {
@@ -61,7 +78,7 @@ class Help(commands.Cog):
 
     @commands.command(name='help', aliases=['h', 'commands'])
     async def help(self, ctx: commands.Context, section: str = None):
-        """Show bot commands. Sections: music, playlist, spotify"""
+        """Show bot commands. Sections: music, playlist, spotify, fun"""
         if section and section.lower() in HELP_PAGES:
             page = HELP_PAGES[section.lower()]
             e = discord.Embed(title=page['title'], color=page['color'])
@@ -73,9 +90,9 @@ class Help(commands.Cog):
         e = discord.Embed(
             title='🐭 PipSqueek Bot',
             description=(
-                'Your friendly neighbourhood music bot!\n\n'
+                'small bot. enormous taste.\n\n'
                 '**Sections** — type `pip help <section>` for full details:\n'
-                '`music` • `playlist` • `spotify`'
+                '`music` • `playlist` • `spotify` • `fun`'
             ),
             color=embeds.PINK
         )
@@ -86,7 +103,8 @@ class Help(commands.Cog):
                 '`pip queue` — view the queue\n'
                 '`pip album <youtube url>` — queue a full album or playlist\n'
                 '`pip playlist create My Mix` — make a personal playlist\n'
-                '`pip spotify <spotify url>` — import a Spotify playlist'
+                '`pip spotify <spotify url>` — import a Spotify playlist\n'
+                '`pip guess` — guess-the-song, hosted by me'
             ),
             inline=False
         )
